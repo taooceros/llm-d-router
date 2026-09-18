@@ -1,0 +1,86 @@
+{
+  "format": 1,
+  "scope": "Copied-source local gateway migration smoke checks only; not hardware qualification",
+  "source_commit": "20c83c18189b18d7898b615814bec0479eb981d4",
+  "python": "3.13.15 (main, Aug 11 2026, 08:30:27) [GCC 15.2.0]",
+  "assembly": [
+    {
+      "repository": "vllm",
+      "manifest_sha256": "8dc21e68210b888e81ffb9b98fe6b83a3974315c3153c01d07cfefe9aa2dfec7",
+      "verified_files": 13
+    },
+    {
+      "repository": "tpu-inference",
+      "manifest_sha256": "7b5e1c616e1e0ee631648c0b2a1a99220a9f7457656e461e352ddb254cbcbefc",
+      "verified_files": 10
+    },
+    {
+      "repository": "llm-d-router",
+      "manifest_sha256": "d249c946cbff36fa5ff21e078de45e7e66c92f3b31e1beae67324af5fbb1c94e",
+      "verified_files": 11
+    },
+    {
+      "repository": "llm-d",
+      "manifest_sha256": "002d1630bcd5898fc89e9745e50f2adc7dca888988b1b668339727147fef3401",
+      "verified_files": 80
+    },
+    {
+      "repository": "llm-d-async",
+      "manifest_sha256": "2eaf163f9b92050e36410952f75d9ebb652b850ef0ea5d6b7b06b68b606275c2",
+      "verified_files": 131
+    }
+  ],
+  "tests": [
+    {
+      "module": "test_gateway_discovery",
+      "returncode": 0,
+      "stdout": "COPIED_PROJECT_IMPORTS={'hetero': 'hetero/__init__.py', 'hetero.gateway': 'hetero/gateway/__init__.py', 'hetero.gateway.discovery': 'hetero/gateway/discovery.py', 'test_gateway_discovery': 'tests/test_gateway_discovery.py'}\n",
+      "stderr": "test_coordinator_generation_changes_without_changing_endpoint (test_gateway_discovery.DiscoveryTests.test_coordinator_generation_changes_without_changing_endpoint) ... ok\ntest_drained_and_stale_worker_endpoints_are_withdrawn (test_gateway_discovery.DiscoveryTests.test_drained_and_stale_worker_endpoints_are_withdrawn) ... ok\ntest_endpoint_and_pod_ambiguity_never_silently_selects_an_owner (test_gateway_discovery.DiscoveryTests.test_endpoint_and_pod_ambiguity_never_silently_selects_an_owner) ... ok\ntest_http_picker_and_noncoordinator_registry_binding_are_rejected (test_gateway_discovery.DiscoveryTests.test_http_picker_and_noncoordinator_registry_binding_are_rejected) ... ok\ntest_maintenance_removes_target_labels_but_never_ignores_stale_addresses (test_gateway_discovery.DiscoveryTests.test_maintenance_removes_target_labels_but_never_ignores_stale_addresses) ... ok\n\n----------------------------------------------------------------------\nRan 5 tests in 0.001s\n\nOK\n",
+      "reproduction_command": "PYTHONPATH=\"$ASSEMBLED:$ASSEMBLED/tests\" python3 -m unittest -v test_gateway_discovery",
+      "tests_passed": 5,
+      "cwd": "$ASSEMBLED"
+    },
+    {
+      "module": "test_gateway_handoff",
+      "returncode": 0,
+      "stdout": "COPIED_PROJECT_IMPORTS={'hetero': 'hetero/__init__.py', 'hetero.gateway': 'hetero/gateway/__init__.py', 'hetero.gateway.policy': 'hetero/gateway/policy.py', 'hetero.gateway.state': 'hetero/gateway/state.py', 'hetero.gateway.core': 'hetero/gateway/core.py', 'test_gateway_handoff': 'tests/test_gateway_handoff.py'}\n",
+      "stderr": "test_cancellation_is_terminal_not_commit_rollback (test_gateway_handoff.GatewayHandoffTests.test_cancellation_is_terminal_not_commit_rollback) ... ok\ntest_kv_transport_and_exactly_once_response (test_gateway_handoff.GatewayHandoffTests.test_kv_transport_and_exactly_once_response) ... ok\ntest_lost_commit_ack_is_never_rolled_back (test_gateway_handoff.GatewayHandoffTests.test_lost_commit_ack_is_never_rolled_back) ... ok\ntest_replacement_generation_cannot_receive_delayed_commit (test_gateway_handoff.GatewayHandoffTests.test_replacement_generation_cannot_receive_delayed_commit) ... ok\ntest_reset_restores_fresh_routing_share (test_gateway_handoff.GatewayHandoffTests.test_reset_restores_fresh_routing_share) ... ok\ntest_uncertain_disk_commit_recovers_forward_before_new_traffic (test_gateway_handoff.GatewayHandoffTests.test_uncertain_disk_commit_recovers_forward_before_new_traffic) ... ok\ntest_unknown_abort_keeps_source_fenced_and_credit_held (test_gateway_handoff.GatewayHandoffTests.test_unknown_abort_keeps_source_fenced_and_credit_held) ... ok\ntest_unsupported_sampling_is_rejected_before_admission (test_gateway_handoff.GatewayHandoffTests.test_unsupported_sampling_is_rejected_before_admission) ... ok\ntest_m_arms_share_the_fresh_admission_boundary (test_gateway_handoff.GatewayLedgerTests.test_m_arms_share_the_fresh_admission_boundary) ... ok\ntest_native_reservation_is_counted_once_after_fresh_observation (test_gateway_handoff.GatewayLedgerTests.test_native_reservation_is_counted_once_after_fresh_observation) ... ok\ntest_single_writer_and_native_ack_gate (test_gateway_handoff.GatewayLedgerTests.test_single_writer_and_native_ack_gate) ... ok\ntest_torn_final_append_cannot_change_recovered_owner (test_gateway_handoff.GatewayLedgerTests.test_torn_final_append_cannot_change_recovered_owner) ... ok\n\n----------------------------------------------------------------------\nRan 12 tests in 0.119s\n\nOK\n",
+      "reproduction_command": "PYTHONPATH=\"$ASSEMBLED:$ASSEMBLED/tests\" python3 -m unittest -v test_gateway_handoff",
+      "tests_passed": 12,
+      "cwd": "$ASSEMBLED"
+    },
+    {
+      "module": "test_gateway_lifecycle",
+      "returncode": 0,
+      "stdout": "[INFO] +    0.58s discovery not settled yet, retrying: logical discovery has missing, stale, or ambiguous endpoints: {'pool': 'omp-hetero', 'target_port': 8000, 'ready': False, 'selector': 'omp.llm-d.ai/instance=tru\n[OMP_EVENT: GATEWAY_READY {\"created\":false,\"instances\":[\"small_a\",\"small_b\"],\"endpoint\":\"127.0.0.1:8200\"}]\n[INFO] +    0.64s discovery not settled yet, retrying: logical discovery has missing, stale, or ambiguous endpoints: {'pool': 'omp-hetero', 'target_port': 8000, 'ready': False, 'selector': 'omp.llm-d.ai/instance=tru\nCOPIED_PROJECT_IMPORTS={'hetero': 'hetero/__init__.py', 'hetero.gateway': 'hetero/gateway/__init__.py', 'hetero.gateway.discovery': 'hetero/gateway/discovery.py', 'hetero.gateway.extproc': 'hetero/gateway/extproc.py', 'hetero.evidence': 'hetero/evidence.py', 'hetero.registry': 'hetero/registry.py', 'hetero.gateway.policy': 'hetero/gateway/policy.py', 'hetero.gateway.state': 'hetero/gateway/state.py', 'hetero.gateway.core': 'hetero/gateway/core.py', 'hetero.gateway.service': 'hetero/gateway/service.py', 'test_gateway_discovery': 'tests/test_gateway_discovery.py', 'test_gateway_handoff': 'tests/test_gateway_handoff.py', 'test_gateway_lifecycle': 'tests/test_gateway_lifecycle.py', 'hetero.native_backend': 'hetero/native_backend.py', 'hetero.engine_actor': 'hetero/engine_actor.py', 'hetero.slice_inventory': 'hetero/slice_inventory.py', 'hetero.layout': 'hetero/layout.py', 'hetero.placement': 'hetero/placement.py', 'hetero.deployment': 'hetero/deployment.py', 'hetero.gateway.lifecycle': 'hetero/gateway/lifecycle.py'}\n",
+      "stderr": "test_no_destructive_action_without_admission_and_native_idle_ack (test_gateway_lifecycle.DrainDeletionTests.test_no_destructive_action_without_admission_and_native_idle_ack) ... ok\ntest_gateway_up_waits_for_maintenance_discovery_and_fails_closed (test_gateway_lifecycle.LifecycleTests.test_gateway_up_waits_for_maintenance_discovery_and_fails_closed) ... ok\ntest_live_responses_capture_and_nonterminal_migration_refuse_maintenance (test_gateway_lifecycle.LifecycleTests.test_live_responses_capture_and_nonterminal_migration_refuse_maintenance) ... ok\ntest_missing_peer_outside_declared_scope_is_never_subset_ready (test_gateway_lifecycle.LifecycleTests.test_missing_peer_outside_declared_scope_is_never_subset_ready) ... ok\ntest_peers_serve_through_extproc_during_drain_and_fresh_same_address_restart (test_gateway_lifecycle.LifecycleTests.test_peers_serve_through_extproc_during_drain_and_fresh_same_address_restart) ... ok\ntest_same_generation_replacement_actor_is_not_a_fresh_binding (test_gateway_lifecycle.LifecycleTests.test_same_generation_replacement_actor_is_not_a_fresh_binding) ... ok\ntest_unacknowledged_drain_and_reused_generation_cannot_promote (test_gateway_lifecycle.LifecycleTests.test_unacknowledged_drain_and_reused_generation_cannot_promote) ... ok\ntest_watch_fails_closed_instead_of_rebinding_unannounced_generation (test_gateway_lifecycle.LifecycleTests.test_watch_fails_closed_instead_of_rebinding_unannounced_generation) ... ok\n\n----------------------------------------------------------------------\nRan 8 tests in 0.562s\n\nOK\n",
+      "reproduction_command": "PYTHONPATH=\"$ASSEMBLED:$ASSEMBLED/tests\" python3 -m unittest -v test_gateway_lifecycle",
+      "tests_passed": 8,
+      "cwd": "$ASSEMBLED"
+    }
+  ],
+  "date": "2026-09-18",
+  "dependencies": {
+    "xds-protos": "1.84.0",
+    "grpcio": "1.84.0",
+    "ray": "2.58.0",
+    "fastapi": "0.141.1",
+    "httpx": "0.28.1",
+    "protobuf": "7.36.2"
+  },
+  "isolation": {
+    "assembly": "245 manifest-listed files copied to a new temporary directory after checking every SHA256; no source fallback",
+    "processes": "One fresh Python process per test module using unittest.defaultTestLoader and TextTestRunner(verbosity=2)",
+    "imports": "After each suite, every loaded hetero.* and test_gateway_* file was asserted to reside inside the temporary assembled workspace",
+    "hardware": "No TPU/GPU workload, Ray cluster or Kubernetes cluster launched; lifecycle used localhost gRPC with injected control-plane peers",
+    "cleanup": "Temporary assembled workspace removed after verification"
+  },
+  "historical_qualification": "Applies only to original frozen runtime; these checks do not physically requalify a native upstream port or prove migration throughput benefit.",
+  "initial_dependency_failure": {
+    "test": "test_gateway_lifecycle",
+    "error": "ModuleNotFoundError: No module named 'envoy'",
+    "resolution": "Used a new /tmp virtualenv with xds-protos==1.84.0, the exact dependency declared by copied scripts/hetero_ctl.py; copied source remained unchanged."
+  },
+  "total_tests_passed": 25,
+  "unresolved_dependencies": []
+}

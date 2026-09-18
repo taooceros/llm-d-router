@@ -1,0 +1,63 @@
+{
+  "format": 1,
+  "source_commit": "20c83c18189b18d7898b615814bec0479eb981d4",
+  "source_repository": "admission-control-vllm local research snapshot",
+  "owner": "llm-d-router",
+  "workspace_files": [
+    {
+      "path": "hetero/gateway/__init__.py",
+      "sha256": "121c909442c9a5112527eb3eb8aa29274cfe2cc8453e2d5bd9447160aa25a9ab",
+      "bytes": 72
+    },
+    {
+      "path": "hetero/gateway/core.py",
+      "sha256": "edbfbd7a8cae2b2339dd524c0f340e2fe0c33ffad7a112a56e84ed14c5149c0e",
+      "bytes": 47260
+    },
+    {
+      "path": "hetero/gateway/discovery.py",
+      "sha256": "ef1a24a9e200fd51e17af7886e2e487fe069450c288866c854672c1cb21f38f5",
+      "bytes": 14178
+    },
+    {
+      "path": "hetero/gateway/extproc.py",
+      "sha256": "5ca49f3ee0977b58a214ba7bd7e4094aa939a0d1a66c8d2717755d6547face21",
+      "bytes": 8941
+    },
+    {
+      "path": "hetero/gateway/lifecycle.py",
+      "sha256": "653b689957601372d9ddc7f2879dcb0581b05dd14504f648f528b889b8291cfe",
+      "bytes": 4008
+    },
+    {
+      "path": "hetero/gateway/policy.py",
+      "sha256": "1bb5d755e1fdfa758631611d8cf76e4d1817b19dc29e50c3df9fec9a28a025f6",
+      "bytes": 10917
+    },
+    {
+      "path": "hetero/gateway/service.py",
+      "sha256": "06b786c74fc01c3128acbe4260d54e8eeb19ab65e413ac013e879deac20ddd92",
+      "bytes": 28392
+    },
+    {
+      "path": "hetero/gateway/state.py",
+      "sha256": "9b3a889aa8338f5d7499f6ba46669340aae5fb98a96a5b11ac72c210bf75d22a",
+      "bytes": 31025
+    },
+    {
+      "path": "tests/test_gateway_discovery.py",
+      "sha256": "3c8aafcc25ab9ad52834f87f047ef2af06f7bd5d4ced5f03fe61ba8f26445ab2",
+      "bytes": 7014
+    },
+    {
+      "path": "tests/test_gateway_handoff.py",
+      "sha256": "33428d7ed9e2c71d34294e19177422e666051fd2cc955e339b06171eaddb5300",
+      "bytes": 20924
+    },
+    {
+      "path": "tests/test_gateway_lifecycle.py",
+      "sha256": "578ed85c6e4926813c770c9446b4b3884f8740ff2a90122ca6748e4c59f980d0",
+      "bytes": 19431
+    }
+  ]
+}

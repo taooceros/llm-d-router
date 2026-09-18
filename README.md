@@ -104,3 +104,75 @@ See [SECURITY.md](SECURITY.md) for vulnerability reporting. Published container 
 
 ## License
 [![FOSSA Status](https://app.fossa.com/api/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-router.svg?type=large)](https://app.fossa.com/projects/git%2Bgithub.com%2Fllm-d%2Fllm-d-router?ref=badge_large)
+
+## Experimental heterogeneous-serving research
+
+The [experimental subtree](experimental/heterogeneous-serving/) preserves the
+Python Envoy ExtProc gateway from the heterogeneous TPU serving research
+snapshot. **It is separate from the upstream Go router/EPP, not a native Go
+plugin or an upstream integration.** The copied gateway implements fixed-layout
+admission policy, ownership epochs, discovery and request handoff. Its original
+Python imports are retained; this subtree alone is not a standalone package.
+
+The research compares fixed layouts on equal 32-chip TPU v5e resources: four
+TP8 instances, two TP16 instances, and a TP8 + TP8 + TP16 mixture. It does not
+implement online topology resizing or establish heterogeneous accelerator-type
+support. Historical FP32-state results belong to the original frozen runtime,
+not a physically requalified native upstream port. In particular, the 24
+migration-enabled timed runs made **zero migration proposals**: the observed
+active-source free-block minimum, 13/102, stayed above the frozen 0.12 pressure
+threshold. They cannot establish an end-to-end migration or KV-transport
+benefit, nor show that executing migration cannot help. See the copied research
+README and compact historical evidence in the sibling llm-d and llm-d-async
+experimental subtrees; policy thresholds were not retuned for migration.
+
+### Assembly and local verification
+
+Check out all five forks (`vllm`, `tpu-inference`, `llm-d-router`, `llm-d`, and
+`llm-d-async`) as sibling directories on
+`research/heterogeneous-tpu-20260918`. From this repository root, use the
+cross-fork assembler owned by the llm-d experimental subtree:
+
+```sh
+python3 ../llm-d/experimental/heterogeneous-serving/assemble.py --forks-root .. --check
+python3 ../llm-d/experimental/heterogeneous-serving/assemble.py --forks-root .. --output /tmp/hetero-workspace
+```
+
+The output must be a new directory outside the fork checkout root. Assembly
+verifies each manifest-listed source hash, preserves the flat research
+workspace, and records `workspace-provenance.json`; it does not fall back to
+the original research checkout. [migration.json](experimental/heterogeneous-serving/migration.json)
+records the exact copied gateway and test hashes.
+
+The [migration verification receipt](experimental/heterogeneous-serving/verification.json)
+records 25 passing existing checks in three isolated processes: discovery (5),
+handoff/ownership/policy (12), and lifecycle (8). The latter exercises a real
+localhost gRPC ExtProc wire with injected control-plane peers, not accelerator
+execution or a live cluster. All loaded project modules were checked to come
+from the assembled copies. Reproduce these scoped checks in an isolated Python
+environment with `xds-protos==1.84.0`, `ray`, `fastapi`, and `httpx` installed
+(the receipt records tested versions):
+
+```sh
+cd /tmp/hetero-workspace
+for module in test_gateway_discovery test_gateway_handoff test_gateway_lifecycle; do
+  PYTHONDONTWRITEBYTECODE=1 PYTHONPATH="$PWD:$PWD/tests" python3 -m unittest -v "$module" || exit 1
+done
+```
+
+### Scoped journal fault envelope
+
+The ownership journal supports coordinator process loss only with the same
+journal/lock path and unchanged live engine generations, plus delayed or
+duplicate RPCs and lost acknowledgements. Complete records are fsynced before
+recoverability-barrier RPCs; torn final appends are discarded, malformed complete
+records fail closed, and write/fsync errors latch uncertainty rather than
+authorize rollback. The file lock is a local single-writer guard, **not a
+distributed lease**. Missing journals beside lock markers, corruption,
+unavailable receipts, and replaced engines refuse new traffic. Loss of the
+entire directory or node requires operator retirement/drain of the old fabric
+before creating a new ledger; the default `/tmp` path does not survive machine
+replacement. Interrupted HTTP responses are not reconstructed: cancellation or
+an explicitly idle-proven reset is required. Native tensors never enter the
+journal. These are scoped protocol guarantees, not general service HA claims.
+
