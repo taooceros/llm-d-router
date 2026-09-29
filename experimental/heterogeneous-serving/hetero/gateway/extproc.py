@@ -150,10 +150,15 @@ class GatewayExternalProcessor(ext_grpc.ExternalProcessorServicer):
             raise
         except ValueError as exc:
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
-        except Exception:
+        except Exception as exc:
             # Never close an incomplete stream with OK: Envoy would then bypass
             # processing. No native state or partial completion is returned.
-            await context.abort(grpc.StatusCode.INTERNAL, "gateway ExtProc processing failed")
+            import traceback
+            from ..evidence import emit_event
+            emit_event("GATEWAY_EXTPROC_ERROR", error=f"{type(exc).__name__}: {exc}"[:500],
+                       traceback=traceback.format_exc()[-2500:])
+            await context.abort(grpc.StatusCode.INTERNAL,
+                                f"gateway ExtProc processing failed: {type(exc).__name__}")
 
 
 class ExtProcServer:
