@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 // Package placement implements initial placement for heterogeneous TPU
-// serving as one plugin: a filter that selects and charges the endpoint, the
+// serving as one plugin: a filter that selects and reserves the endpoint, the
 // profile handler that reports refusals, and the request-control hooks that
 // keep the capacity projection in step with the request lifecycle.
 package placement
@@ -25,7 +25,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"sigs.k8s.io/controller-runtime/pkg/log"
 
@@ -43,6 +46,16 @@ const (
 	PlacementType = "hetero-placement"
 	// TraceHeader carries the JSON decision trace on responses and refusals.
 	TraceHeader = "x-omp-route-trace"
+	// DefaultBindLease is how long a reservation made by Bind survives without
+	// the request reaching PreRequest.
+	DefaultBindLease = 10 * time.Second
+)
+
+// Reasons a bound decision is not kept, recorded as Trace.RebindReason.
+const (
+	RebindEndpointGone      = "endpoint_gone"
+	RebindEndpointReplaced  = "endpoint_replaced"
+	RebindReservationLapsed = "reservation_lapsed"
 )
 
 var (
@@ -50,6 +63,8 @@ var (
 	// scheduling. The filter keeps the bound endpoint instead of selecting.
 	BoundDecisionKey = plugin.NewDataKey("hetero/bound-decision", PlacementType)
 	traceKey         = plugin.NewDataKey("hetero/route-trace", PlacementType)
+	tokenKey         = plugin.NewDataKey("hetero/reservation-token", PlacementType)
+	tokenSeq         atomic.Uint64
 )
 
 var (
@@ -59,53 +74,95 @@ var (
 	_ fwkrc.ResponseHeaderProcessor = &Plugin{}
 	_ fwkrc.ResponseBodyProcessor   = &Plugin{}
 	_ plugin.ConsumerPlugin         = &Plugin{}
+	_ plugin.StateDumper            = &Plugin{}
 )
 
+// ReservationToken returns the token keying request's reservation, creating it
+// on first use. The token is unique per InferenceRequest, so clients reusing a
+// request ID across live requests do not share a reservation.
+func ReservationToken(request *fwksched.InferenceRequest) string {
+	if token, ok := fwksched.ReadRequestAttribute[string](request, tokenKey); ok {
+		return token
+	}
+	token := "rsv-" + strconv.FormatUint(tokenSeq.Add(1), 10)
+	request.PutAttribute(tokenKey, token)
+	return token
+}
+
+type parameters struct {
+	capacity.Policy
+	// BindLeaseSeconds bounds how long a reservation is held for a request that
+	// has not reached PreRequest.
+	BindLeaseSeconds float64 `json:"bindLeaseSeconds"`
+	// AdminAddress, when set, serves GET /hetero/state and POST /hetero/reset.
+	AdminAddress string `json:"adminAddress"`
+}
+
 // Factory builds a Plugin from Policy parameters.
-func Factory(name string, decoder *json.Decoder, _ plugin.Handle) (plugin.Plugin, error) {
-	policy := capacity.DefaultPolicy()
+func Factory(name string, decoder *json.Decoder, handle plugin.Handle) (plugin.Plugin, error) {
+	params := parameters{Policy: capacity.DefaultPolicy(), BindLeaseSeconds: DefaultBindLease.Seconds()}
 	if decoder != nil {
-		if err := decoder.Decode(&policy); err != nil {
+		if err := decoder.Decode(&params); err != nil {
 			return nil, fmt.Errorf("failed to parse the parameters of the '%s' plugin - %w", PlacementType, err)
 		}
 	}
-	if err := validate(policy); err != nil {
+	if err := validate(params); err != nil {
 		return nil, fmt.Errorf("invalid configuration for '%s' plugin: %w", PlacementType, err)
 	}
-	return New(name, policy), nil
+	p := New(name, params.Policy)
+	p.bindLease = time.Duration(params.BindLeaseSeconds * float64(time.Second))
+	if params.AdminAddress != "" {
+		ctx := context.Background()
+		if handle != nil {
+			ctx = handle.Context()
+		}
+		if err := p.serveAdmin(ctx, params.AdminAddress); err != nil {
+			return nil, fmt.Errorf("'%s' plugin admin server: %w", PlacementType, err)
+		}
+	}
+	return p, nil
 }
 
-func validate(p capacity.Policy) error {
+func validate(p parameters) error {
 	switch {
 	case p.LargeFreshTrafficShare < 0 || p.LargeFreshTrafficShare > 1:
 		return errors.New("'largeFreshTrafficShare' must be within [0, 1]")
 	case p.SmallPromptTokenLimit < 0, p.ReserveLargeHeadroomBlocks < 0, p.LongReserveTokens < 0, p.AdmissionGrowthBlocks < 0:
 		return errors.New("token and block parameters must be non-negative")
-	case p.DispatchOrder != capacity.DispatchArrival && p.DispatchOrder != capacity.DispatchLongestPromptFirst:
-		return fmt.Errorf("'dispatchOrder' must be %q or %q", capacity.DispatchArrival, capacity.DispatchLongestPromptFirst)
+	case p.BindLeaseSeconds <= 0:
+		return errors.New("'bindLeaseSeconds' must be positive")
 	}
 	return nil
 }
 
 // New returns a Plugin with its own capacity tracker and selector.
 func New(name string, policy capacity.Policy) *Plugin {
-	return &Plugin{
+	p := &Plugin{
 		typedName: plugin.TypedName{Type: PlacementType, Name: name},
 		policy:    policy,
 		tracker:   capacity.NewTracker(),
 		selector:  NewSelector(policy),
+		bindLease: DefaultBindLease,
 	}
+	p.tracker.OnExpire(func(_ string, r capacity.Reservation) { p.selector.Rollback(r.Large) })
+	return p
 }
 
 // Plugin places fresh requests per the heterogeneous routing policy. It must
-// be the last filter of its profile, since it charges the endpoint it keeps.
+// be the last filter of its profile, since it reserves the endpoint it keeps.
+//
+// A reservation starts as a lease taken by Bind and becomes permanent in
+// PreRequest, after which the director reports the end of the request to
+// ResponseBody. A request that fails between the two never reaches either, so
+// its lease lapses after the bind lease and rolls back the quota.
 type Plugin struct {
 	typedName plugin.TypedName
 	policy    capacity.Policy
 	tracker   *capacity.Tracker
 	selector  *Selector
-	// bindMu makes observation, selection and charge one step, so concurrent
-	// requests do not select against the same free blocks.
+	bindLease time.Duration
+	// bindMu makes observation, selection and reservation one step, so
+	// concurrent requests do not select against the same free blocks.
 	bindMu sync.Mutex
 }
 
@@ -121,43 +178,66 @@ func (p *Plugin) Tracker() *capacity.Tracker { return p.tracker }
 func (p *Plugin) Selector() *Selector { return p.selector }
 
 // Consumes declares the custom capacity metrics. They are optional so a
-// missing metric removes the endpoint from placement instead of failing startup.
+// missing metric makes the endpoint unavailable instead of failing startup.
 func (p *Plugin) Consumes() plugin.DataDependencies {
 	return plugin.DataDependencies{Optional: capacity.ConsumedKeys()}
 }
 
-// Bind observes endpoints, selects one and charges it to req.ID.
+// Bind observes endpoints, selects one and leases its blocks to req.Token.
 func (p *Plugin) Bind(endpoints []capacity.Source, req Request, opts Options) (Decision, bool) {
 	p.bindMu.Lock()
 	defer p.bindMu.Unlock()
 	snap := make([]capacity.EndpointCapacity, 0, len(endpoints))
 	for _, ep := range endpoints {
-		if c, ok := p.tracker.Observe(ep); ok {
-			snap = append(snap, c)
-		}
+		c, _ := p.tracker.Observe(ep)
+		snap = append(snap, c)
 	}
 	decision, ok := p.selector.Select(snap, req, opts)
 	if ok {
-		p.tracker.Charge(req.ID, decision.Endpoint, decision.ChargeBlocks)
+		large := false
+		for _, c := range snap {
+			if c.Name == decision.Endpoint {
+				large = c.Role == capacity.RoleLarge
+				break
+			}
+		}
+		p.tracker.Lease(req.Token, decision.Endpoint, decision.ChargeBlocks, large, p.bindLease)
 	}
 	return decision, ok
+}
+
+// Unbind drops request's reservation. A reservation that was never confirmed
+// also rolls back its quota advance.
+func (p *Plugin) Unbind(request *fwksched.InferenceRequest) {
+	if token, ok := fwksched.ReadRequestAttribute[string](request, tokenKey); ok {
+		p.release(token)
+	}
+}
+
+func (p *Plugin) release(token string) {
+	if r, ok := p.tracker.Release(token); ok && r.Pending() {
+		p.selector.Rollback(r.Large)
+	}
 }
 
 // Filter keeps the single endpoint chosen for the request, or none.
 func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest, endpoints []fwksched.Endpoint) []fwksched.Endpoint {
 	logger := log.FromContext(ctx)
+	token := ReservationToken(request)
+	var opts Options
+	rebind := ""
 	if bound, ok := fwksched.ReadRequestAttribute[Decision](request, BoundDecisionKey); ok {
-		if ep := find(endpoints, bound.Endpoint); ep != nil {
-			if charged, _, ok := p.tracker.Charged(request.RequestID); ok && charged == bound.Endpoint {
-				trace := bound.Trace
-				trace.Bound = true
-				request.PutAttribute(traceKey, &trace)
-				logger.V(logging.DEBUG).Info("Hetero placement kept bound endpoint", "endpoint", bound.Endpoint)
-				return []fwksched.Endpoint{ep}
-			}
+		ep, reason := p.boundEndpoint(endpoints, bound, token)
+		if ep != nil {
+			trace := bound.Trace
+			trace.Bound = true
+			request.PutAttribute(traceKey, &trace)
+			logger.V(logging.DEBUG).Info("Hetero placement kept bound endpoint", "endpoint", bound.Endpoint)
+			return []fwksched.Endpoint{ep}
 		}
-		p.tracker.Release(request.RequestID)
-		logger.Info("Hetero placement bound endpoint is gone, selecting again", "endpoint", bound.Endpoint)
+		p.release(token)
+		opts, rebind = bound.Options, reason
+		logger.Info("Hetero placement selecting again for a bound request", "endpoint", bound.Endpoint, "reason", reason)
 	}
 
 	promptTokens, ok := capacity.PromptTokens(request)
@@ -173,18 +253,37 @@ func (p *Plugin) Filter(ctx context.Context, request *fwksched.InferenceRequest,
 	}
 	decision, ok := p.Bind(sources, Request{
 		ID:           request.RequestID,
+		Token:        token,
 		PromptTokens: promptTokens,
 		MaxTokens:    capacity.MaxTokens(request),
-	}, Options{})
+	}, opts)
 	trace := decision.Trace
+	trace.RebindReason = rebind
 	request.PutAttribute(traceKey, &trace)
 	logger.Info("Hetero placement decision", "promptTokens", promptTokens, "context", trace.Context,
 		"reason", trace.Reason, "pools", trace.Pools, "fallback", trace.Fallback,
-		"selected", trace.Selected, "refusal", trace.Refusal, "scores", trace.Scores)
+		"selected", trace.Selected, "refusal", trace.Refusal, "scores", trace.Scores, "rebindReason", rebind)
 	if !ok {
 		return nil
 	}
 	return []fwksched.Endpoint{find(endpoints, decision.Endpoint)}
+}
+
+// boundEndpoint returns the candidate a bound decision named when it is the
+// same engine and still holds the reservation, or the reason it cannot be kept.
+func (p *Plugin) boundEndpoint(endpoints []fwksched.Endpoint, bound Decision, token string) (fwksched.Endpoint, string) {
+	ep := find(endpoints, bound.Endpoint)
+	if ep == nil {
+		return nil, RebindEndpointGone
+	}
+	meta := ep.GetMetadata()
+	if meta.ID.String() != bound.EndpointID || meta.Labels[capacity.GenerationLabel] != bound.Generation {
+		return nil, RebindEndpointReplaced
+	}
+	if r, ok := p.tracker.Reservation(token); !ok || r.Endpoint != bound.Endpoint {
+		return nil, RebindReservationLapsed
+	}
+	return ep, ""
 }
 
 // Pick runs every profile once.
@@ -202,14 +301,15 @@ func (p *Plugin) Pick(_ context.Context, _ *fwksched.InferenceRequest, profiles 
 func (p *Plugin) ProcessResults(_ context.Context, request *fwksched.InferenceRequest,
 	profileResults map[string]*fwksched.ProfileRunResult) (*fwksched.SchedulingResult, error) {
 	if len(profileResults) != 1 {
+		p.Unbind(request)
 		return nil, fmt.Errorf("'%s' supports a single scheduling profile, got %d", PlacementType, len(profileResults))
 	}
 	for name, result := range profileResults {
 		if result != nil {
 			return &fwksched.SchedulingResult{ProfileResults: profileResults, PrimaryProfileName: name}, nil
 		}
-		// A filter after this plugin may have removed the charged endpoint.
-		p.tracker.Release(request.RequestID)
+		// A filter after this plugin may have removed the reserved endpoint.
+		p.Unbind(request)
 		trace, ok := fwksched.ReadRequestAttribute[*Trace](request, traceKey)
 		if !ok || trace.Refusal == "" {
 			return nil, fmt.Errorf("failed to run scheduler profile '%s'", name)
@@ -225,8 +325,8 @@ func (p *Plugin) ProcessResults(_ context.Context, request *fwksched.InferenceRe
 	return nil, errors.New("unreachable")
 }
 
-// PreRequest charges the endpoint the request is sent to when it differs from
-// the one charged during filtering.
+// PreRequest confirms the reservation of the endpoint the request is sent to,
+// reserving that endpoint when it differs from the one selected.
 func (p *Plugin) PreRequest(ctx context.Context, request *fwksched.InferenceRequest, result *fwksched.SchedulingResult) error {
 	if request == nil || result == nil {
 		return nil
@@ -235,9 +335,11 @@ func (p *Plugin) PreRequest(ctx context.Context, request *fwksched.InferenceRequ
 	if primary == nil || len(primary.TargetEndpoints) == 0 {
 		return nil
 	}
+	token := ReservationToken(request)
 	target := primary.TargetEndpoints[0]
 	name := capacity.EndpointName(target.GetMetadata())
-	if charged, _, ok := p.tracker.Charged(request.RequestID); ok && charged == name {
+	if r, ok := p.tracker.Reservation(token); ok && r.Endpoint == name {
+		p.tracker.Confirm(token)
 		return nil
 	}
 	observed, ok := p.tracker.Observe(target)
@@ -246,7 +348,7 @@ func (p *Plugin) PreRequest(ctx context.Context, request *fwksched.InferenceRequ
 	}
 	promptTokens, _ := capacity.PromptTokens(request)
 	blocks := p.policy.ChargeBlocks(promptTokens, capacity.MaxTokens(request), observed.BlockSize)
-	p.tracker.Charge(request.RequestID, name, blocks)
+	p.tracker.Charge(token, name, blocks)
 	log.FromContext(ctx).V(logging.DEBUG).Info("Hetero placement charged the dispatched endpoint", "endpoint", name, "blocks", blocks)
 	return nil
 }
@@ -261,12 +363,12 @@ func (p *Plugin) ResponseHeader(_ context.Context, request *fwksched.InferenceRe
 	}
 }
 
-// ResponseBody releases the charge when the response ends for any reason.
+// ResponseBody releases the reservation when the response ends for any reason.
 func (p *Plugin) ResponseBody(_ context.Context, request *fwksched.InferenceRequest, response *fwkrc.Response, _ *fwkdl.EndpointMetadata) {
 	if request == nil || response == nil || !response.EndOfStream {
 		return
 	}
-	p.tracker.Release(request.RequestID)
+	p.Unbind(request)
 }
 
 func find(endpoints []fwksched.Endpoint, name string) fwksched.Endpoint {

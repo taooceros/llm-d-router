@@ -44,7 +44,10 @@ const (
 
 // Request is the part of a request initial placement reads.
 type Request struct {
-	ID           string
+	// ID identifies the request in traces.
+	ID string
+	// Token keys the request's reservation; see ReservationToken.
+	Token        string
 	PromptTokens int
 	// MaxTokens is ignored when the policy is decode-length blind.
 	MaxTokens int
@@ -68,6 +71,7 @@ type Trace struct {
 	DecodeLengthBlind   bool               `json:"decode_length_blind"`
 	Context             int                `json:"context"`
 	Considered          []string           `json:"considered"`
+	MissingMetrics      []string           `json:"missing_metrics,omitempty"`
 	Eligible            []string           `json:"eligible"`
 	FitsSmall           []string           `json:"fits_small,omitempty"`
 	WorkConservingLarge bool               `json:"work_conserving_large"`
@@ -82,18 +86,27 @@ type Trace struct {
 	ExtraHeld           map[string]int     `json:"dynamic_reserve_blocks,omitempty"`
 	// Bound marks a request placed ahead of scheduling by late binding.
 	Bound bool `json:"bound,omitempty"`
+	// RebindReason is set when a bound decision could not be kept and the
+	// request was placed again.
+	RebindReason string `json:"rebind_reason,omitempty"`
 }
 
 // Decision is the outcome of a selection.
 type Decision struct {
-	Endpoint      string
+	Endpoint string
+	// EndpointID and Generation identify the engine Endpoint named when the
+	// decision was made.
+	EndpointID    string
+	Generation    string
 	ContextTokens int
 	// NeedBlocks is the admission need on Endpoint.
 	NeedBlocks int
 	// ChargeBlocks is the projection charged to Endpoint.
 	ChargeBlocks int
 	Long         bool
-	Trace        Trace
+	// Options are the options the decision was made with.
+	Options Options
+	Trace   Trace
 }
 
 // Selector implements initial placement and owns the fresh-traffic quota
@@ -111,33 +124,46 @@ func NewSelector(policy capacity.Policy) *Selector {
 	return &Selector{policy: policy}
 }
 
-// Select chooses the endpoint for a fresh request from snap. The quota
-// counters advance only when it returns true.
+// Select chooses the endpoint for a fresh request from snap. Entries with
+// MissingMetrics only decide whether some endpoint supports the context. The
+// quota counters advance only when it returns true.
 func (s *Selector) Select(snap []capacity.EndpointCapacity, req Request, opts Options) (Decision, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	policy := s.policy
-	context := policy.ContextTokens(req.PromptTokens, req.MaxTokens, snap)
+	observed := make([]capacity.EndpointCapacity, 0, len(snap))
+	var missing []capacity.EndpointCapacity
+	for _, ep := range snap {
+		if ep.MissingMetrics {
+			missing = append(missing, ep)
+		} else {
+			observed = append(observed, ep)
+		}
+	}
+	context := policy.ContextTokens(req.PromptTokens, req.MaxTokens, observed)
 	trace := Trace{
 		Phase:             phaseInitial,
 		RequestID:         req.ID,
 		PromptTokens:      req.PromptTokens,
 		DecodeLengthBlind: policy.DecodeLengthBlind,
 		Context:           context,
-		Considered:        names(snap),
+		Considered:        names(observed),
 		LateBinding:       opts.LateBinding,
 		ExtraHeld:         opts.ExtraHeld,
+	}
+	if len(missing) > 0 {
+		trace.MissingMetrics = names(missing)
 	}
 	if !policy.DecodeLengthBlind {
 		maxTokens := req.MaxTokens
 		trace.MaxTokens = &maxTokens
 	}
 	long := policy.IsLong(req.PromptTokens)
-	decision := Decision{ContextTokens: context, Long: long}
+	decision := Decision{ContextTokens: context, Long: long, Options: opts}
 
 	var eligible, small, large, fitsSmall []capacity.EndpointCapacity
-	for _, ep := range snap {
+	for _, ep := range observed {
 		if ep.MaxModelLen < context {
 			continue
 		}
@@ -154,7 +180,15 @@ func (s *Selector) Select(snap []capacity.EndpointCapacity, req Request, opts Op
 	}
 	trace.Eligible = names(eligible)
 	if len(eligible) == 0 {
+		// An endpoint that supports the context but has no metrics yet can
+		// serve the request once it is scraped.
 		trace.Refusal = RefusalNoContextSupport
+		for _, ep := range missing {
+			if ep.MaxModelLen >= context {
+				trace.Refusal = RefusalNoCapacity
+				break
+			}
+		}
 		decision.Trace = trace
 		return decision, false
 	}
@@ -238,10 +272,29 @@ func (s *Selector) Select(snap []capacity.EndpointCapacity, req Request, opts Op
 	trace.SelectedFreeBlocks = chosen.FreeBlocks
 
 	decision.Endpoint = chosen.Name
+	decision.EndpointID = chosen.ID
+	decision.Generation = chosen.Generation
 	decision.NeedBlocks = capacity.NeedBlocks(chosen, context)
 	decision.ChargeBlocks = policy.ChargeBlocks(req.PromptTokens, req.MaxTokens, chosen.BlockSize)
 	decision.Trace = trace
 	return decision, true
+}
+
+// Rollback undoes the quota advance of one selection that was not dispatched.
+func (s *Selector) Rollback(large bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.freshDispatched = max(0, s.freshDispatched-1)
+	if large {
+		s.freshToLarge = max(0, s.freshToLarge-1)
+	}
+}
+
+// Reset zeroes the quota counters.
+func (s *Selector) Reset() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.freshDispatched, s.freshToLarge = 0, 0
 }
 
 // Counters returns the fresh requests dispatched and those sent to large endpoints.

@@ -18,6 +18,7 @@ package capacity
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -80,24 +81,30 @@ func TestObserve(t *testing.T) {
 			got, ok := tracker.Observe(endpoint("large", RoleLarge, tt.free, 282, 256, tt.running, tt.waiting))
 			require.True(t, ok)
 			want := tt.want
-			want.Name, want.Role, want.TP, want.MaxModelLen, want.BlockSize, want.TotalBlocks = "large", RoleLarge, 16, 36864, 256, 282
+			want.Name, want.ID, want.Role, want.TP, want.MaxModelLen, want.BlockSize, want.TotalBlocks = "large", "ns/large-pod", RoleLarge, 16, 36864, 256, 282
 			assert.Equal(t, want, got)
 		})
 	}
 }
 
 func TestObserveMissingMetrics(t *testing.T) {
-	meta := &fwkdl.EndpointMetadata{ID: types.NamespacedName{Namespace: "ns", Name: "pod"}}
+	meta := &fwkdl.EndpointMetadata{
+		ID:     types.NamespacedName{Namespace: "ns", Name: "pod"},
+		Labels: map[string]string{RoleLabel: "large", MaxModelLenLabel: "36864", GenerationLabel: "3"},
+	}
 	tracker := NewTracker()
 
-	_, ok := tracker.Observe(fwksched.NewEndpoint(meta, &fwkdl.Metrics{CacheBlockSize: 64, CacheNumBlocks: 412}, nil))
+	got, ok := tracker.Observe(fwksched.NewEndpoint(meta, &fwkdl.Metrics{CacheBlockSize: 64, CacheNumBlocks: 412}, nil))
 	assert.False(t, ok, "free blocks have no fallback")
+	assert.Equal(t, EndpointCapacity{Name: "ns/pod", ID: "ns/pod", Generation: "3", Role: RoleLarge, MaxModelLen: 36864, MissingMetrics: true}, got,
+		"label facts are reported without metrics")
+	assert.False(t, HasRoom(got, 1, true, DefaultPolicy(), 0))
 
 	attrs := fwkdl.NewAttributes()
 	attrs.Put(FreeBlocksKey, attrmetrics.ScalarMetricValue(10))
-	got, ok := tracker.Observe(fwksched.NewEndpoint(meta, &fwkdl.Metrics{CacheBlockSize: 64, CacheNumBlocks: 412}, attrs))
+	got, ok = tracker.Observe(fwksched.NewEndpoint(meta, &fwkdl.Metrics{CacheBlockSize: 64, CacheNumBlocks: 412}, attrs))
 	require.True(t, ok, "block size and total fall back to core metrics")
-	assert.Equal(t, "ns/pod", got.Name)
+	assert.False(t, got.MissingMetrics)
 	assert.Equal(t, 64, got.BlockSize)
 	assert.Equal(t, 412, got.TotalBlocks)
 }
@@ -109,7 +116,7 @@ func TestTrackerChargeRelease(t *testing.T) {
 	blocks, requests := tracker.Projected("small_a")
 	assert.Equal(t, [2]int{15, 2}, [2]int{blocks, requests})
 
-	// Charging the same request again moves it instead of adding.
+	// Charging the same token again moves it instead of adding.
 	v := tracker.Version()
 	tracker.Charge("r1", "large", 4)
 	assert.Greater(t, tracker.Version(), v)
@@ -118,14 +125,65 @@ func TestTrackerChargeRelease(t *testing.T) {
 	blocks, requests = tracker.Projected("large")
 	assert.Equal(t, [2]int{4, 1}, [2]int{blocks, requests})
 
-	assert.True(t, tracker.Release("r1"))
+	_, released := tracker.Release("r1")
+	assert.True(t, released)
 	v = tracker.Version()
-	assert.False(t, tracker.Release("r1"), "release is idempotent")
+	_, released = tracker.Release("r1")
+	assert.False(t, released, "release is idempotent")
 	assert.Equal(t, v, tracker.Version())
 	blocks, requests = tracker.Projected("large")
 	assert.Equal(t, [2]int{0, 0}, [2]int{blocks, requests})
 	_, _, ok := tracker.Charged("r1")
 	assert.False(t, ok)
+}
+
+func TestTrackerLease(t *testing.T) {
+	now := time.Unix(1000, 0)
+	tracker := NewTracker()
+	tracker.SetClock(func() time.Time { return now })
+	var expired []string
+	tracker.OnExpire(func(token string, r Reservation) {
+		assert.True(t, r.Large)
+		expired = append(expired, token)
+	})
+
+	tracker.Lease("unconfirmed", "large", 40, true, 10*time.Second)
+	tracker.Lease("confirmed", "large", 30, true, 10*time.Second)
+	tracker.Lease("later", "large", 20, true, 20*time.Second)
+	require.True(t, tracker.Confirm("confirmed"))
+	assert.False(t, tracker.Confirm("absent"))
+	r, _ := tracker.Reservation("confirmed")
+	assert.False(t, r.Pending())
+
+	now = now.Add(10*time.Second - time.Nanosecond)
+	blocks, requests := tracker.Projected("large")
+	assert.Equal(t, [2]int{90, 3}, [2]int{blocks, requests}, "leases hold until the deadline")
+
+	now = now.Add(time.Nanosecond)
+	blocks, requests = tracker.Projected("large")
+	assert.Equal(t, [2]int{50, 2}, [2]int{blocks, requests}, "an unconfirmed lease lapses at its deadline")
+	assert.Equal(t, []string{"unconfirmed"}, expired)
+
+	now = now.Add(time.Hour)
+	assert.Equal(t, 1, tracker.Expire())
+	assert.Equal(t, []string{"unconfirmed", "later"}, expired)
+	blocks, requests = tracker.Projected("large")
+	assert.Equal(t, [2]int{30, 1}, [2]int{blocks, requests}, "a confirmed reservation has no deadline")
+
+	// A lease replaced by a charge no longer expires.
+	tracker.Lease("moved", "small_a", 5, false, time.Second)
+	tracker.Charge("moved", "small_b", 6)
+	now = now.Add(time.Hour)
+	assert.Zero(t, tracker.Expire())
+	blocks, _ = tracker.Projected("small_b")
+	assert.Equal(t, 6, blocks)
+
+	perEndpoint, leases := tracker.State()
+	assert.Zero(t, leases)
+	assert.Equal(t, map[string]ProjectionState{"large": {Blocks: 30, Requests: 1}, "small_b": {Blocks: 6, Requests: 1}}, perEndpoint)
+	assert.Equal(t, 2, tracker.Reset())
+	perEndpoint, _ = tracker.State()
+	assert.Empty(t, perEndpoint)
 }
 
 func TestHasRoom(t *testing.T) {

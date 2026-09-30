@@ -23,6 +23,7 @@ package capacity
 import (
 	"strconv"
 	"sync"
+	"time"
 
 	fwkdl "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
@@ -36,6 +37,7 @@ const (
 	RoleLabel        = "omp.llm-d.ai/role"
 	TPLabel          = "omp.llm-d.ai/tp"
 	MaxModelLenLabel = "omp.llm-d.ai/max-model-len"
+	GenerationLabel  = "omp.llm-d.ai/generation"
 )
 
 // Custom metric attribute keys configured on the core metrics extractor.
@@ -104,12 +106,20 @@ func EndpointName(meta *fwkdl.EndpointMetadata) string {
 
 // EndpointCapacity is one endpoint's capacity after applying the projection.
 type EndpointCapacity struct {
-	Name        string
+	Name string
+	// ID is the endpoint's datastore identity and Generation its generation
+	// label; together they tell a replacement engine from the one a decision
+	// was made against.
+	ID          string
+	Generation  string
 	Role        Role
 	TP          int
 	MaxModelLen int
-	BlockSize   int
-	TotalBlocks int
+	// MissingMetrics marks an endpoint whose capacity metrics are not yet
+	// scraped. Only its label facts are set; it has no room.
+	MissingMetrics bool
+	BlockSize      int
+	TotalBlocks    int
 	// FreeBlocks is total - max(observed used, projected used), floored at 0.
 	FreeBlocks int
 	// AdmissibleBlocks is min(engine free - min(engine free, running), FreeBlocks).
@@ -130,15 +140,8 @@ type Policy struct {
 	WorkConservingFallback     bool    `json:"workConservingFallback"`
 	DecodeLengthBlind          bool    `json:"decodeLengthBlind"`
 	AdmissionGrowthBlocks      int     `json:"admissionGrowthBlocks"`
-	DispatchOrder              string  `json:"dispatchOrder"`
 	DynamicLongReserve         bool    `json:"dynamicLongReserve"`
 }
-
-// Dispatch orders accepted in Policy.DispatchOrder.
-const (
-	DispatchArrival            = "arrival"
-	DispatchLongestPromptFirst = "longest_prompt_first"
-)
 
 // DefaultPolicy returns the RoutingPolicy defaults.
 func DefaultPolicy() Policy {
@@ -147,7 +150,6 @@ func DefaultPolicy() Policy {
 		LargeFreshTrafficShare:     0.25,
 		ReserveLargeHeadroomBlocks: 64,
 		AdmissionGrowthBlocks:      1,
-		DispatchOrder:              DispatchArrival,
 	}
 }
 
@@ -240,92 +242,235 @@ func MaxTokens(request *fwksched.InferenceRequest) int {
 	return int(*request.Body.MaxOutputTokens)
 }
 
-type charge struct {
-	endpoint string
-	blocks   int
+// Reservation is the projection held for one placed request.
+type Reservation struct {
+	Endpoint string
+	Blocks   int
+	// Large marks a reservation counted toward the large fresh-traffic quota.
+	Large bool
+	// Expires is the lease deadline of an unconfirmed reservation. It is zero
+	// once the reservation is confirmed.
+	Expires time.Time
 }
+
+// Pending reports whether the reservation is an unconfirmed lease.
+func (r Reservation) Pending() bool { return !r.Expires.IsZero() }
 
 type projection struct {
 	blocks   int
 	requests int
 }
 
-// Tracker holds the blocks charged to placed requests, keyed by request ID.
+// Tracker holds the blocks reserved for placed requests, keyed by a
+// reservation token unique to each live request. A reservation starts as a
+// lease that is dropped at its deadline unless confirmed, so a request that
+// fails before the router can observe its end does not hold blocks forever.
 // It is safe for concurrent use.
 type Tracker struct {
-	mu          sync.Mutex
-	charges     map[string]charge
-	perEndpoint map[string]projection
-	version     uint64
+	mu           sync.Mutex
+	now          func() time.Time
+	onExpire     func(token string, r Reservation)
+	reservations map[string]Reservation
+	leases       map[string]time.Time
+	nextExpiry   time.Time
+	perEndpoint  map[string]projection
+	version      uint64
 }
 
 // NewTracker returns an empty Tracker.
 func NewTracker() *Tracker {
 	return &Tracker{
-		charges:     map[string]charge{},
-		perEndpoint: map[string]projection{},
+		now:          time.Now,
+		reservations: map[string]Reservation{},
+		leases:       map[string]time.Time{},
+		perEndpoint:  map[string]projection{},
 	}
 }
 
-// Charge charges blocks on endpoint for requestID. Charging a requestID again
-// replaces its previous charge.
-func (t *Tracker) Charge(requestID, endpoint string, blocks int) {
+// SetClock replaces the clock used for lease deadlines.
+func (t *Tracker) SetClock(now func() time.Time) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	if old, ok := t.charges[requestID]; ok {
-		t.removeLocked(old)
-	}
-	c := charge{endpoint: endpoint, blocks: blocks}
-	t.charges[requestID] = c
-	row := t.perEndpoint[endpoint]
-	row.blocks += blocks
-	row.requests++
-	t.perEndpoint[endpoint] = row
-	t.version++
+	t.now = now
 }
 
-// Release drops the charge of requestID and reports whether one existed.
-func (t *Tracker) Release(requestID string) bool {
+// OnExpire sets the function called, outside the tracker lock, for every lease
+// dropped at its deadline.
+func (t *Tracker) OnExpire(fn func(token string, r Reservation)) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	c, ok := t.charges[requestID]
+	t.onExpire = fn
+}
+
+// Lease reserves blocks on endpoint for token until ttl passes without Confirm.
+// Reserving a token again replaces its previous reservation.
+func (t *Tracker) Lease(token, endpoint string, blocks int, large bool, ttl time.Duration) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	expires := t.now().Add(ttl)
+	t.putLocked(token, Reservation{Endpoint: endpoint, Blocks: blocks, Large: large, Expires: expires})
+	t.leases[token] = expires
+	if t.nextExpiry.IsZero() || expires.Before(t.nextExpiry) {
+		t.nextExpiry = expires
+	}
+}
+
+// Charge reserves blocks on endpoint for token without a deadline. Charging a
+// token again replaces its previous reservation.
+func (t *Tracker) Charge(token, endpoint string, blocks int) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.putLocked(token, Reservation{Endpoint: endpoint, Blocks: blocks})
+}
+
+// Confirm removes the deadline of token's lease and reports whether token
+// holds a reservation.
+func (t *Tracker) Confirm(token string) bool {
+	t.Expire()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	r, ok := t.reservations[token]
 	if !ok {
 		return false
 	}
-	delete(t.charges, requestID)
-	t.removeLocked(c)
-	t.version++
+	if r.Pending() {
+		r.Expires = time.Time{}
+		t.reservations[token] = r
+		delete(t.leases, token)
+	}
 	return true
 }
 
-func (t *Tracker) removeLocked(c charge) {
-	row := t.perEndpoint[c.endpoint]
-	row.blocks = max(0, row.blocks-c.blocks)
-	row.requests = max(0, row.requests-1)
-	if row.requests == 0 {
-		delete(t.perEndpoint, c.endpoint)
-		return
-	}
-	t.perEndpoint[c.endpoint] = row
-}
-
-// Charged returns the endpoint and blocks charged to requestID.
-func (t *Tracker) Charged(requestID string) (endpoint string, blocks int, ok bool) {
+// Release drops the reservation of token and returns it.
+func (t *Tracker) Release(token string) (Reservation, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
-	c, ok := t.charges[requestID]
-	return c.endpoint, c.blocks, ok
+	r, ok := t.reservations[token]
+	if ok {
+		t.dropLocked(token, r)
+	}
+	return r, ok
 }
 
-// Projected returns the blocks and requests charged to endpoint.
+// Reservation returns the reservation held by token.
+func (t *Tracker) Reservation(token string) (Reservation, bool) {
+	t.Expire()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	r, ok := t.reservations[token]
+	return r, ok
+}
+
+// Charged returns the endpoint and blocks reserved for token.
+func (t *Tracker) Charged(token string) (endpoint string, blocks int, ok bool) {
+	r, ok := t.Reservation(token)
+	return r.Endpoint, r.Blocks, ok
+}
+
+// Projected returns the blocks and requests reserved on endpoint, after
+// dropping expired leases.
 func (t *Tracker) Projected(endpoint string) (blocks, requests int) {
+	t.Expire()
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	row := t.perEndpoint[endpoint]
 	return row.blocks, row.requests
 }
 
-// Version increases on every Charge and Release.
+// Expire drops the leases whose deadline has passed and returns how many.
+func (t *Tracker) Expire() int {
+	t.mu.Lock()
+	now := t.now()
+	if len(t.leases) == 0 || now.Before(t.nextExpiry) {
+		t.mu.Unlock()
+		return 0
+	}
+	type expired struct {
+		token string
+		r     Reservation
+	}
+	var dropped []expired
+	t.nextExpiry = time.Time{}
+	for token, deadline := range t.leases {
+		if now.Before(deadline) {
+			if t.nextExpiry.IsZero() || deadline.Before(t.nextExpiry) {
+				t.nextExpiry = deadline
+			}
+			continue
+		}
+		r := t.reservations[token]
+		t.dropLocked(token, r)
+		dropped = append(dropped, expired{token, r})
+	}
+	hook := t.onExpire
+	t.mu.Unlock()
+	if hook != nil {
+		for _, e := range dropped {
+			hook(e.token, e.r)
+		}
+	}
+	return len(dropped)
+}
+
+// Reset drops every reservation and returns how many there were.
+func (t *Tracker) Reset() int {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	n := len(t.reservations)
+	t.reservations = map[string]Reservation{}
+	t.leases = map[string]time.Time{}
+	t.nextExpiry = time.Time{}
+	t.perEndpoint = map[string]projection{}
+	t.version++
+	return n
+}
+
+// ProjectionState is the reservation total on one endpoint.
+type ProjectionState struct {
+	Blocks   int `json:"blocks"`
+	Requests int `json:"requests"`
+}
+
+// State returns the reservation totals by endpoint and the number of
+// unconfirmed leases.
+func (t *Tracker) State() (perEndpoint map[string]ProjectionState, leases int) {
+	t.Expire()
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	perEndpoint = make(map[string]ProjectionState, len(t.perEndpoint))
+	for name, row := range t.perEndpoint {
+		perEndpoint[name] = ProjectionState{Blocks: row.blocks, Requests: row.requests}
+	}
+	return perEndpoint, len(t.leases)
+}
+
+func (t *Tracker) putLocked(token string, r Reservation) {
+	if old, ok := t.reservations[token]; ok {
+		t.dropLocked(token, old)
+	}
+	t.reservations[token] = r
+	row := t.perEndpoint[r.Endpoint]
+	row.blocks += r.Blocks
+	row.requests++
+	t.perEndpoint[r.Endpoint] = row
+	t.version++
+}
+
+func (t *Tracker) dropLocked(token string, r Reservation) {
+	delete(t.reservations, token)
+	delete(t.leases, token)
+	row := t.perEndpoint[r.Endpoint]
+	row.blocks = max(0, row.blocks-r.Blocks)
+	row.requests = max(0, row.requests-1)
+	if row.requests == 0 {
+		delete(t.perEndpoint, r.Endpoint)
+	} else {
+		t.perEndpoint[r.Endpoint] = row
+	}
+	t.version++
+}
+
+// Version increases on every reservation change.
 func (t *Tracker) Version() uint64 {
 	t.mu.Lock()
 	defer t.mu.Unlock()
@@ -333,11 +478,20 @@ func (t *Tracker) Version() uint64 {
 }
 
 // Observe computes the capacity of src. ok is false when src does not report
-// free blocks, total blocks and block size.
+// free blocks, total blocks and block size; the result then carries only the
+// label facts and MissingMetrics.
 func (t *Tracker) Observe(src Source) (EndpointCapacity, bool) {
 	meta := src.GetMetadata()
 	if meta == nil {
-		return EndpointCapacity{}, false
+		return EndpointCapacity{MissingMetrics: true}, false
+	}
+	labels := EndpointCapacity{
+		Name:        EndpointName(meta),
+		ID:          meta.ID.String(),
+		Generation:  meta.Labels[GenerationLabel],
+		Role:        Role(meta.Labels[RoleLabel]),
+		TP:          atoi(meta.Labels[TPLabel]),
+		MaxModelLen: atoi(meta.Labels[MaxModelLenLabel]),
 	}
 	metrics := src.GetMetrics()
 	if metrics == nil {
@@ -353,36 +507,21 @@ func (t *Tracker) Observe(src Source) (EndpointCapacity, bool) {
 		blockSize, okBlock = metrics.CacheBlockSize, metrics.CacheBlockSize > 0
 	}
 	if !okFree || !okTotal || !okBlock || total <= 0 || blockSize <= 0 {
-		return EndpointCapacity{}, false
+		labels.MissingMetrics = true
+		return labels, false
 	}
-	name := EndpointName(meta)
-	projectedBlocks, projectedRequests := t.Projected(name)
+	projectedBlocks, projectedRequests := t.Projected(labels.Name)
 	running := metrics.RunningRequestsSize
 	engineAdmissible := max(0, free-min(free, running))
 	effectiveFree := max(0, total-max(total-free, projectedBlocks))
-	return EndpointCapacity{
-		Name:             name,
-		Role:             Role(meta.Labels[RoleLabel]),
-		TP:               atoi(meta.Labels[TPLabel]),
-		MaxModelLen:      atoi(meta.Labels[MaxModelLenLabel]),
-		BlockSize:        blockSize,
-		TotalBlocks:      total,
-		FreeBlocks:       effectiveFree,
-		AdmissibleBlocks: min(engineAdmissible, effectiveFree),
-		Running:          running,
-		Waiting:          metrics.WaitingQueueSize + max(0, projectedRequests-running),
-	}, true
-}
-
-// Snapshot observes endpoints, skipping those without capacity metrics.
-func (t *Tracker) Snapshot(endpoints []fwksched.Endpoint) []EndpointCapacity {
-	snap := make([]EndpointCapacity, 0, len(endpoints))
-	for _, ep := range endpoints {
-		if c, ok := t.Observe(ep); ok {
-			snap = append(snap, c)
-		}
-	}
-	return snap
+	c := labels
+	c.BlockSize = blockSize
+	c.TotalBlocks = total
+	c.FreeBlocks = effectiveFree
+	c.AdmissibleBlocks = min(engineAdmissible, effectiveFree)
+	c.Running = running
+	c.Waiting = metrics.WaitingQueueSize + max(0, projectedRequests-running)
+	return c, true
 }
 
 func scalar(src Source, key plugin.DataKey) (int, bool) {
