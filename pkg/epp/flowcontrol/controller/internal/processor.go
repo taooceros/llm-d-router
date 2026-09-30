@@ -465,6 +465,11 @@ func (p *Processor) recordCapacityUtilization() {
 // However, if a selected item is saturated (cannot be scheduled), the cycle stops immediately. This enforces HoL
 // blocking to respect the policy's decision and prevent priority inversion, where dispatching lower-priority work might
 // exacerbate the saturation affecting the high-priority item.
+//
+// # Gated Dispatch
+//
+// With a DispatchGate, the saturation check still gates bands, but each open band dispatches every item the gate's
+// pass admits (see dispatchBandGated) and the cycle reports whether any item was dispatched.
 func (p *Processor) dispatchCycle(ctx context.Context) bool {
 	dispatchCycleStart := time.Now()
 	defer func() {

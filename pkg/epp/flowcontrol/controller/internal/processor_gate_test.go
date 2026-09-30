@@ -50,7 +50,9 @@ var (
 	_ flowcontrol.DispatchPass = &fakeGate{}
 )
 
-func (g *fakeGate) TypedName() plugin.TypedName { return plugin.TypedName{Type: "fake-gate", Name: "fake-gate"} }
+func (g *fakeGate) TypedName() plugin.TypedName {
+	return plugin.TypedName{Type: "fake-gate", Name: "fake-gate"}
+}
 func (g *fakeGate) Saturation(context.Context, []fwkdl.Endpoint) float64 { return g.saturation }
 
 func (g *fakeGate) BeginDispatchPass(_ context.Context, _ []fwkdl.Endpoint, queueChanged bool) flowcontrol.DispatchPass {
