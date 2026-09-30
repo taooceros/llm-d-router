@@ -18,6 +18,7 @@ limitations under the License.
 package internal
 
 import (
+	"container/heap"
 	"context"
 	"errors"
 	"fmt"
@@ -102,6 +103,15 @@ type Processor struct {
 	// synchronization.
 	ceilings []float64
 
+	// dispatchGate is the SaturationDetector's DispatchGate, or nil when the detector does not implement one. A non-nil
+	// gate switches dispatchCycle to per-item gated dispatch; see flowcontrol.DispatchGate.
+	dispatchGate flowcontrol.DispatchGate
+	// gateQueueChanged records that items were added to or removed from the queues since the last dispatch pass began.
+	// Set by the Run goroutine (enqueue, dispatch) and the cleanup sweep.
+	gateQueueChanged atomic.Bool
+	// gateItems is the reusable per-band item buffer of gated dispatch. Only accessed from the Run goroutine.
+	gateItems []flowcontrol.QueueItemAccessor
+
 	// wg is used to wait for background tasks (cleanup sweep) to complete on shutdown.
 	wg             sync.WaitGroup
 	isShuttingDown atomic.Bool
@@ -156,6 +166,9 @@ func NewProcessor(
 	// Seeded so readers never handle a nil sample. The pool reads as non-empty until the first dispatch cycle observes
 	// otherwise, which keeps a request that arrives before that cycle on the saturation budget.
 	p.regime.Store(&regimeSample{})
+	if gate, ok := saturationDetector.(flowcontrol.DispatchGate); ok {
+		p.dispatchGate = gate
+	}
 	return p
 }
 
@@ -266,7 +279,9 @@ func (p *Processor) Run(ctx context.Context) {
 				continue
 			}
 			p.enqueue(item)
-			p.dispatchCycle(ctx) // Process immediately when an item arrives
+			if p.dispatchGate == nil {
+				p.dispatchCycle(ctx) // Process immediately when an item arrives
+			}
 		case <-dispatchTicker.C():
 			p.dispatchCycle(ctx) // Periodically attempt to dispatch from queues
 		case desired := <-priorityBandUpdateCh:
@@ -365,6 +380,9 @@ func (p *Processor) enqueue(item *FlowItem) {
 			"flowKey", key, "requestID", req.ID())
 		p.finalizeAndRecordDrop(item, fmt.Errorf("%w: %w", types.ErrRejected, finalErr))
 		return
+	}
+	if p.dispatchGate != nil {
+		p.gateQueueChanged.Store(true)
 	}
 	p.logger.V(logutil.TRACE).Info("Item enqueued.",
 		"flowKey", key, "requestID", req.ID())
@@ -502,6 +520,11 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 	ceilings := p.ceilingsBuffer(len(priorities))
 	p.usageLimitPolicy.ComputeLimit(ctx, saturation, priorities, ceilings)
 
+	// pass is opened lazily at the first open band, so a cycle that the saturation check stops before any band keeps
+	// gateQueueChanged for the next cycle.
+	var pass flowcontrol.DispatchPass
+	passStarted := false
+	dispatched := false
 	for i, priority := range priorities {
 		// --- Viability Check (Saturation/HoL Blocking) ---
 		// Check before selecting an item: if we are already saturated for this priority, stop immediately.
@@ -514,12 +537,28 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 			}
 			// Stop the dispatch cycle entirely to respect strict policy decision and prevent priority inversion where
 			// lower-priority work might exacerbate the saturation affecting high-priority work.
-			return false
+			return dispatched
 		}
 
 		originalBand, err := p.registry.PriorityBandAccessor(priority)
 		if err != nil {
 			p.logger.Error(err, "Failed to get PriorityBandAccessor, skipping band", "priority", priority)
+			continue
+		}
+
+		if p.dispatchGate != nil {
+			if !passStarted {
+				passStarted = true
+				pass = p.dispatchGate.BeginDispatchPass(ctx, pool, p.gateQueueChanged.Swap(false))
+			}
+			if pass == nil {
+				return dispatched
+			}
+			bandDispatched, stop := p.dispatchBandGated(ctx, pass, originalBand)
+			dispatched = dispatched || bandDispatched
+			if stop {
+				return dispatched
+			}
 			continue
 		}
 
@@ -542,7 +581,113 @@ func (p *Processor) dispatchCycle(ctx context.Context) bool {
 		}
 		return true
 	}
-	return false
+	return dispatched
+}
+
+// dispatchBandGated visits the live items of every flow in band in the band's OrderingPolicy order and dispatches each
+// item that pass admits. Items are popped lazily from a heap, so a pass that stops early does not pay for a full sort.
+// It reports whether any item was dispatched and whether the pass asked to stop.
+func (p *Processor) dispatchBandGated(
+	ctx context.Context,
+	pass flowcontrol.DispatchPass,
+	band flowcontrol.PriorityBandAccessor,
+) (dispatched, stop bool) {
+	items := p.gateItems[:0]
+	var ordering flowcontrol.OrderingPolicy
+	collect := func(itemAcc flowcontrol.QueueItemAccessor) bool {
+		if fi, ok := itemAcc.(*FlowItem); ok && fi.FinalState() == nil {
+			items = append(items, itemAcc)
+		}
+		return false
+	}
+	band.IterateQueues(func(queue flowcontrol.FlowQueueAccessor) bool {
+		if queue.Len() == 0 {
+			return true
+		}
+		mq, err := p.registry.ManagedQueue(queue.FlowKey())
+		if err != nil {
+			return true
+		}
+		if ordering == nil {
+			ordering = queue.OrderingPolicy()
+		}
+		// A predicate that never matches visits every item without removing any.
+		mq.Cleanup(collect)
+		return true
+	})
+	defer func() {
+		clear(items)
+		p.gateItems = items[:0]
+	}()
+	if len(items) == 0 {
+		return false, false
+	}
+
+	h := &gateItemHeap{items: items, policy: ordering}
+	heap.Init(h)
+	for h.Len() > 0 {
+		item := heap.Pop(h).(flowcontrol.QueueItemAccessor)
+		switch pass.Admit(ctx, item) {
+		case flowcontrol.DispatchStop:
+			return dispatched, true
+		case flowcontrol.DispatchAdmit:
+			if p.dispatchGatedItem(item) {
+				dispatched = true
+			} else {
+				pass.Revert(item)
+			}
+		}
+	}
+	return dispatched, false
+}
+
+// dispatchGatedItem removes an admitted item from its queue and finalizes it as dispatched. It returns false when the
+// item was not dispatched, which happens when the item was finalized concurrently (cancellation or expiry).
+func (p *Processor) dispatchGatedItem(itemAcc flowcontrol.QueueItemAccessor) bool {
+	req := itemAcc.OriginalRequest()
+	key := req.FlowKey()
+	managedQ, err := p.registry.ManagedQueue(key)
+	if err != nil {
+		p.logger.Error(err, "Failed to get ManagedQueue for gated dispatch", "flowKey", key, "requestID", req.ID())
+		return false
+	}
+	removedItemAcc, err := managedQ.Remove(itemAcc.Handle())
+	if err != nil {
+		p.logger.V(logutil.DEBUG).Info("Failed to remove item during gated dispatch (likely already finalized and swept).",
+			"flowKey", key, "requestID", req.ID(), "err", err)
+		return false
+	}
+	p.gateQueueChanged.Store(true)
+	removedItem, ok := removedItemAcc.(*FlowItem)
+	if !ok {
+		p.logger.Error(nil, "Internal error: removed item has unexpected type", "flowKey", key, "requestID", req.ID(),
+			"type", fmt.Sprintf("%T", removedItemAcc))
+		return false
+	}
+	removedItem.FinalizeWithError(nil)
+	if removedItem.FinalState().Outcome != types.QueueOutcomeDispatched {
+		p.recordDrop(removedItem.FinalState().Outcome)
+		return false
+	}
+	p.logger.V(logutil.TRACE).Info("Item dispatched.", "flowKey", key, "requestID", req.ID())
+	return true
+}
+
+// gateItemHeap orders the items of one band by the band's OrderingPolicy for gated dispatch.
+type gateItemHeap struct {
+	items  []flowcontrol.QueueItemAccessor
+	policy flowcontrol.OrderingPolicy
+}
+
+func (h *gateItemHeap) Len() int           { return len(h.items) }
+func (h *gateItemHeap) Less(i, j int) bool { return h.policy.Less(h.items[i], h.items[j]) }
+func (h *gateItemHeap) Swap(i, j int)      { h.items[i], h.items[j] = h.items[j], h.items[i] }
+func (h *gateItemHeap) Push(x any)         { h.items = append(h.items, x.(flowcontrol.QueueItemAccessor)) }
+func (h *gateItemHeap) Pop() any {
+	n := len(h.items)
+	item := h.items[n-1]
+	h.items = h.items[:n-1]
+	return item
 }
 
 // ceilingsBuffer returns the reusable ceilings buffer sized to n, every element reset to 1.0 (no
@@ -701,6 +846,7 @@ func (p *Processor) sweepFinalizedItems() {
 		}
 		removedItems := managedQ.Cleanup(predicate)
 		if len(removedItems) > 0 {
+			p.gateQueueChanged.Store(true)
 			for _, itemAcc := range removedItems {
 				if fi, ok := itemAcc.(*FlowItem); ok && fi != nil && fi.FinalState() != nil {
 					p.recordDrop(fi.FinalState().Outcome)
