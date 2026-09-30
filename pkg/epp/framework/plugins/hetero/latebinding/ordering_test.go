@@ -24,6 +24,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
+	fwkplugin "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol/mocks"
 	fwkrh "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/requesthandling"
 	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
@@ -66,5 +67,44 @@ func TestLongestPromptFirst_Less(t *testing.T) {
 			t.Parallel()
 			assert.Equal(t, tc.want, policy.Less(tc.a, tc.b))
 		})
+	}
+}
+
+func TestLongestPromptFirst_Aging(t *testing.T) {
+	t.Parallel()
+	p, err := LongestPromptFirstFactory("aged", fwkplugin.StrictDecoder([]byte(`{"agingTokensPerSecond": 60}`)), nil)
+	require.NoError(t, err)
+	policy := p.(flowcontrol.OrderingPolicy)
+
+	now := time.Now()
+	short := queueItem("short", 500, now)
+	cases := []struct {
+		name string
+		a, b flowcontrol.QueueItemAccessor
+		want bool
+	}{
+		{"a longer prompt arriving soon after still dispatches first",
+			queueItem("long", 30000, now.Add(60*time.Second)), short, true},
+		// 60 tokens/s over 600 s is 36000 tokens of aging, more than the 29500-token difference.
+		{"a request that waited long enough dispatches before a newer, longer prompt",
+			short, queueItem("long", 30000, now.Add(600*time.Second)), true},
+		{"equal aged keys dispatch in arrival order",
+			short, queueItem("later", 500+60*10, now.Add(10*time.Second)), true},
+		{"older longer prompts stay ahead", queueItem("old-long", 30000, now.Add(-time.Second)), short, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			assert.Equal(t, tc.want, policy.Less(tc.a, tc.b))
+			assert.Equal(t, !tc.want, policy.Less(tc.b, tc.a), "the order is antisymmetric")
+		})
+	}
+}
+
+func TestLongestPromptFirst_Parameters(t *testing.T) {
+	t.Parallel()
+	for _, raw := range []string{`{"agingTokensPerSecond": -1}`, `{"aging": 1}`} {
+		_, err := LongestPromptFirstFactory("", fwkplugin.StrictDecoder([]byte(raw)), nil)
+		assert.Error(t, err, raw)
 	}
 }

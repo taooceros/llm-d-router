@@ -196,8 +196,9 @@ type pass struct {
 	full bool
 }
 
-// Admit binds item through placement. A request whose prompt length is unknown is admitted unbound, so placement
-// refuses it at scheduling instead of the request waiting in the queue indefinitely.
+// Admit binds item through placement. Only a capacity refusal keeps the item queued. Any other refusal (a prompt of
+// unknown length, a context no endpoint's max-model-len admits) cannot be cured by waiting, so the item is admitted
+// unbound and placement refuses it at scheduling.
 func (p *pass) Admit(_ context.Context, item flowcontrol.QueueItemAccessor) flowcontrol.DispatchVerdict {
 	if p.full {
 		return flowcontrol.DispatchStop
@@ -217,10 +218,17 @@ func (p *pass) Admit(_ context.Context, item flowcontrol.QueueItemAccessor) flow
 	}
 	decision, ok := p.gate.binder.Bind(p.gate.sources, req, opts)
 	if !ok {
+		if decision.Trace.Refusal != placement.RefusalNoCapacity {
+			p.logger.V(logutil.DEBUG).Info("Releasing unservable request to placement", "requestID", req.ID,
+				"promptTokens", promptTokens, "refusal", decision.Trace.Refusal)
+			return flowcontrol.DispatchAdmit
+		}
 		if long && p.policy.DynamicLongReserve && p.held == nil {
-			p.held = p.gate.reserveFor(decision.ContextTokens)
-			p.logger.V(logutil.DEBUG).Info("Holding dynamic long reserve", "requestID", req.ID,
-				"promptTokens", promptTokens, "reserveBlocks", p.held)
+			if held := p.gate.reserveFor(decision.ContextTokens); len(held) > 0 {
+				p.held = held
+				p.logger.V(logutil.DEBUG).Info("Holding dynamic long reserve", "requestID", req.ID,
+					"promptTokens", promptTokens, "reserveBlocks", held)
+			}
 		}
 		return flowcontrol.DispatchSkip
 	}
@@ -236,8 +244,8 @@ func (p *pass) Revert(item flowcontrol.QueueItemAccessor) {
 }
 
 // reserveFor returns the blocks a context of contextTokens needs on every large endpoint that could ever hold it:
-// its max-model-len admits the context and the need fits within the endpoint's total blocks after headroom. The map
-// is non-nil even when empty, so the first unplaced long request of a pass fixes the reserve.
+// its max-model-len admits the context and the need fits within the endpoint's total blocks after headroom. An empty
+// result leaves the reserve open for the next unplaced long request of the pass.
 func (g *Gate) reserveFor(contextTokens int) map[string]int {
 	policy := g.binder.Policy()
 	held := make(map[string]int, len(g.snap))

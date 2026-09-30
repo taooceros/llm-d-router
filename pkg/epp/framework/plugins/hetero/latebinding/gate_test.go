@@ -154,13 +154,30 @@ func TestGate_DynamicLongReserve(t *testing.T) {
 			want:     []string{"", "large", ""},
 		},
 		{
-			name:      "a long request no large endpoint can ever hold reserves nothing",
+			name:      "a long request no endpoint's max-model-len admits is released unbound and reserves nothing",
 			policy:    dynamic,
 			endpoints: mixedLayout(0, 120),
 			// 40000 tokens exceed max-model-len 36864 on every endpoint.
 			requests: [][2]any{{"too-long", 40000}, {"short", 500}},
-			want:     []string{"", "large"},
-			wantHeld: map[string]int{},
+			want:     []string{unbound, "large"},
+		},
+		{
+			name:      "a released unservable request leaves the reserve to the next unplaced long request",
+			policy:    dynamic,
+			endpoints: mixedLayout(smallTotal, 120),
+			requests:  [][2]any{{"too-long", 40000}, {"long", 30000}, {"short", 500}},
+			want:      []string{unbound, "", "small_b"},
+			wantHeld:  map[string]int{"large": 119},
+		},
+		{
+			name:   "a long request no large endpoint can ever hold leaves the reserve to the next one",
+			policy: dynamic,
+			endpoints: []datalayer.Endpoint{small("small_a", smallTotal), small("small_b", smallTotal),
+				endpoint("large", capacity.RoleLarge, largeMaxLen, largeBlock, 150, 120)},
+			// 36000 + 256 tokens is 142 blocks, which with the headroom exceeds the 150 total.
+			requests: [][2]any{{"never-fits", 36000}, {"long", 30000}, {"short", 500}},
+			want:     []string{"", "", "small_b"},
+			wantHeld: map[string]int{"large": 119},
 		},
 	}
 	for _, tc := range cases {
@@ -172,9 +189,12 @@ func TestGate_DynamicLongReserve(t *testing.T) {
 			var lastBound *admission
 			for i := range got {
 				endpoints[i] = got[i].endpoint
-				if got[i].verdict == flowcontrol.DispatchAdmit {
+				switch {
+				case got[i].verdict == flowcontrol.DispatchAdmit && got[i].endpoint == "":
+					endpoints[i] = unbound
+				case got[i].verdict == flowcontrol.DispatchAdmit:
 					lastBound = &got[i]
-				} else {
+				default:
 					assert.Equal(t, flowcontrol.DispatchSkip, got[i].verdict)
 				}
 			}
@@ -185,6 +205,9 @@ func TestGate_DynamicLongReserve(t *testing.T) {
 		})
 	}
 }
+
+// unbound marks a request the gate admits without binding it, leaving the refusal to placement.
+const unbound = "(unbound)"
 
 func TestGate_PassBindsOnlyWhatFits(t *testing.T) {
 	t.Parallel()
