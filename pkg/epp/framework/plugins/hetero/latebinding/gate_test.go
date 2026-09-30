@@ -38,6 +38,7 @@ type admission struct {
 	verdict  flowcontrol.DispatchVerdict
 	endpoint string
 	trace    placement.Trace
+	token    string
 }
 
 // runPass opens one pass over endpoints and admits requests (id -> prompt tokens) in the given order.
@@ -50,6 +51,7 @@ func runPass(t *testing.T, gate *Gate, endpoints []datalayer.Endpoint, requests 
 	for i, r := range requests {
 		item := queueItem(r[0].(string), r[1].(int), now.Add(time.Duration(i)*time.Millisecond))
 		a := admission{verdict: pass.Admit(context.Background(), item)}
+		a.token = placement.ReservationToken(item.OriginalRequest().InferenceRequest())
 		if d, ok := fwksched.ReadRequestAttribute[placement.Decision](item.OriginalRequest().InferenceRequest(),
 			placement.BoundDecisionKey); ok {
 			a.endpoint, a.trace = d.Endpoint, d.Trace
@@ -73,7 +75,7 @@ func TestGate_NoOwedWait(t *testing.T) {
 	assert.Contains(t, []string{"small_a", "small_b"}, got[0].endpoint)
 	assert.Equal(t, placement.ReasonLargeFreshTraffic, got[0].trace.Reason)
 	assert.True(t, got[0].trace.Fallback)
-	endpoint, blocks, ok := pl.Tracker().Charged("short")
+	endpoint, blocks, ok := pl.Tracker().Charged(got[0].token)
 	require.True(t, ok, "the gate charges the endpoint it binds")
 	assert.Equal(t, got[0].endpoint, endpoint)
 	assert.Equal(t, capacity.BlocksFor(500, smallBlock)+1, blocks)
@@ -89,8 +91,20 @@ func TestGate_BackfillPastUnplacedLongRequest(t *testing.T) {
 	assert.Equal(t, flowcontrol.DispatchSkip, got[0].verdict)
 	assert.Equal(t, flowcontrol.DispatchAdmit, got[1].verdict)
 	assert.Equal(t, flowcontrol.DispatchAdmit, got[2].verdict)
-	_, _, charged := pl.Tracker().Charged("long")
+	_, _, charged := pl.Tracker().Charged(got[0].token)
 	assert.False(t, charged, "a skipped request holds no charge")
+}
+
+func TestGate_MissingTelemetryKeepsRequestQueued(t *testing.T) {
+	t.Parallel()
+	// Large does not report free blocks, so the long request it alone could serve waits instead of being refused.
+	pl := placement.New("placement", testPolicy())
+	got := runPass(t, NewGate("gate", pl), mixedLayout(smallTotal, noMetrics),
+		[][2]any{{"long", 30000}, {"short", 500}})
+
+	assert.Equal(t, flowcontrol.DispatchSkip, got[0].verdict)
+	assert.Equal(t, flowcontrol.DispatchAdmit, got[1].verdict)
+	assert.Contains(t, []string{"small_a", "small_b"}, got[1].endpoint)
 }
 
 func TestGate_DynamicLongReserve(t *testing.T) {
@@ -287,11 +301,10 @@ func TestGate_UnknownPromptIsAdmittedUnbound(t *testing.T) {
 	assert.Equal(t, flowcontrol.DispatchAdmit, pass.Admit(context.Background(), &mocks.MockQueueItemAccessor{OriginalRequestV: req}))
 	_, bound := fwksched.ReadRequestAttribute[placement.Decision](req.InferenceRequestV, placement.BoundDecisionKey)
 	assert.False(t, bound)
-	_, _, charged := pl.Tracker().Charged("text")
-	assert.False(t, charged)
+	assert.Zero(t, projectedTotal(pl), "an unbound request holds no reservation")
 }
 
-func TestGate_RevertReleasesCharge(t *testing.T) {
+func TestGate_RevertReleasesLeaseAndQuota(t *testing.T) {
 	t.Parallel()
 	pl := placement.New("placement", testPolicy())
 	pass := NewGate("gate", pl).BeginDispatchPass(context.Background(), mixedLayout(smallTotal, largeTotal), true)
@@ -299,9 +312,42 @@ func TestGate_RevertReleasesCharge(t *testing.T) {
 	item := queueItem("cancelled", 500, time.Now())
 
 	require.Equal(t, flowcontrol.DispatchAdmit, pass.Admit(context.Background(), item))
+	dispatched, _ := pl.Selector().Counters()
+	require.Equal(t, 1, dispatched)
 	pass.Revert(item)
-	_, _, charged := pl.Tracker().Charged("cancelled")
-	assert.False(t, charged)
+	assert.Zero(t, projectedTotal(pl))
+	dispatched, _ = pl.Selector().Counters()
+	assert.Zero(t, dispatched, "reverting a bind rolls back the fresh-traffic quota")
+}
+
+func TestGate_UnscheduledBindExpires(t *testing.T) {
+	t.Parallel()
+	pl := placement.New("placement", testPolicy())
+	now := time.Now()
+	pl.Tracker().SetClock(func() time.Time { return now })
+	gate := NewGate("gate", pl)
+	endpoints := []datalayer.Endpoint{large("large", largeTotal)}
+
+	// Both requests are bound but never reach PreRequest.
+	got := runPass(t, gate, endpoints, [][2]any{{"lost", 33700}, {"lost-2", 33700}})
+	require.Equal(t, flowcontrol.DispatchAdmit, got[1].verdict)
+	assert.Nil(t, gate.BeginDispatchPass(context.Background(), endpoints, true))
+
+	now = now.Add(placement.DefaultBindLease)
+	got = runPass(t, gate, endpoints, [][2]any{{"next", 33700}})
+	assert.Equal(t, flowcontrol.DispatchAdmit, got[0].verdict, "expired leases free their blocks for queued requests")
+	blocks, requests := pl.Tracker().Projected("large")
+	assert.Equal(t, 133, blocks)
+	assert.Equal(t, 1, requests)
+}
+
+func projectedTotal(pl *placement.Plugin) int {
+	total := 0
+	for _, name := range []string{"small_a", "small_b", "large"} {
+		blocks, _ := pl.Tracker().Projected(name)
+		total += blocks
+	}
+	return total
 }
 
 func TestGate_Saturation(t *testing.T) {

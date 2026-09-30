@@ -60,9 +60,14 @@ func endpoint(name string, role capacity.Role, maxLen, block, total, free int) *
 	}, datalayer.NewMetrics())
 	ep.GetAttributes().Put(capacity.TotalBlocksKey, attrmetrics.ScalarMetricValue(total))
 	ep.GetAttributes().Put(capacity.BlockSizeKey, attrmetrics.ScalarMetricValue(block))
-	setFree(ep, free)
+	if free != noMetrics {
+		setFree(ep, free)
+	}
 	return ep
 }
+
+// noMetrics as the free block count builds an endpoint that does not report free blocks.
+const noMetrics = -1
 
 func setFree(ep datalayer.Endpoint, free int) {
 	ep.GetAttributes().Put(capacity.FreeBlocksKey, attrmetrics.ScalarMetricValue(free))

@@ -51,6 +51,7 @@ type lateBindingController struct {
 
 	mu       sync.Mutex
 	outcomes map[string]types.QueueOutcome
+	tokens   map[string]string
 }
 
 func newLateBindingController(t *testing.T, policy capacity.Policy, ordering flowcontrol.OrderingPolicy,
@@ -83,17 +84,26 @@ func newLateBindingController(t *testing.T, policy capacity.Policy, ordering flo
 		EndpointCandidates: &contractmocks.MockEndpointCandidates{Candidates: endpoints},
 		UsageLimitPolicy:   usagelimits.DefaultPolicy(),
 	})
-	return &lateBindingController{ctx: ctx, fc: fc, reg: reg, placement: pl, outcomes: map[string]types.QueueOutcome{}}
+	return &lateBindingController{ctx: ctx, fc: fc, reg: reg, placement: pl,
+		outcomes: map[string]types.QueueOutcome{}, tokens: map[string]string{}}
 }
 
-// submit enqueues a request and records its outcome when EnqueueAndWait returns.
+// submit enqueues a request and records its outcome and reservation token when EnqueueAndWait returns.
 func (c *lateBindingController) submit(id string, promptTokens int) {
 	go func() {
-		outcome, _ := c.fc.EnqueueAndWait(c.ctx, flowRequest(id, promptTokens))
+		req := flowRequest(id, promptTokens)
+		outcome, _ := c.fc.EnqueueAndWait(c.ctx, req)
 		c.mu.Lock()
 		c.outcomes[id] = outcome
+		c.tokens[id] = placement.ReservationToken(req.InferenceRequestV)
 		c.mu.Unlock()
 	}()
+}
+
+func (c *lateBindingController) token(id string) string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.tokens[id]
 }
 
 func (c *lateBindingController) dispatched() []string {
@@ -144,7 +154,7 @@ func TestController_ConcurrentArrivalsFillWithoutOverbooking(t *testing.T) {
 		assert.LessOrEqual(t, blocks, limit, "endpoint %s is overbooked", name)
 	}
 	for _, id := range c.dispatched() {
-		endpoint, _, ok := tracker.Charged(id)
+		endpoint, _, ok := tracker.Charged(c.token(id))
 		assert.True(t, ok, "dispatched request %s holds a charge", id)
 		assert.NotEmpty(t, endpoint)
 	}
@@ -152,8 +162,8 @@ func TestController_ConcurrentArrivalsFillWithoutOverbooking(t *testing.T) {
 	// Completing five requests on large frees room for exactly five more.
 	released := 0
 	for _, id := range c.dispatched() {
-		if endpoint, _, _ := tracker.Charged(id); endpoint == "large" && released < 5 {
-			tracker.Release(id)
+		if endpoint, _, _ := tracker.Charged(c.token(id)); endpoint == "large" && released < 5 {
+			tracker.Release(c.token(id))
 			released++
 		}
 	}

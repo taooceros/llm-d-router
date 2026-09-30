@@ -34,6 +34,7 @@ import (
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/datalayer"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/flowcontrol"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/interface/plugin"
+	fwksched "github.com/llm-d/llm-d-router/pkg/epp/framework/interface/scheduling"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/hetero/capacity"
 	"github.com/llm-d/llm-d-router/pkg/epp/framework/plugins/hetero/placement"
 )
@@ -92,11 +93,14 @@ func GateFactory(name string, raw *json.Decoder, handle plugin.Handle) (plugin.P
 	return NewGate(name, binder), nil
 }
 
-// Binder is the placement surface the gate uses. *placement.Plugin implements it.
+// Binder is the placement surface the gate uses. *placement.Plugin implements it. Bind takes a pending lease on the
+// chosen endpoint that placement confirms when the request reaches PreRequest; a lease that is not confirmed in time
+// expires, so a request that fails between dispatch and scheduling does not hold blocks.
 type Binder interface {
 	Policy() capacity.Policy
 	Tracker() *capacity.Tracker
 	Bind(endpoints []capacity.Source, req placement.Request, opts placement.Options) (placement.Decision, bool)
+	Unbind(request *fwksched.InferenceRequest)
 }
 
 // Gate is the late-binding dispatch gate. BeginDispatchPass and the pass methods run on the flow-control processor
@@ -115,6 +119,7 @@ type Gate struct {
 var (
 	_ flowcontrol.SaturationDetector = &Gate{}
 	_ flowcontrol.DispatchGate       = &Gate{}
+	_ Binder                         = &placement.Plugin{}
 )
 
 // NewGate returns a gate that binds through binder.
@@ -209,7 +214,12 @@ func (p *pass) Admit(_ context.Context, item flowcontrol.QueueItemAccessor) flow
 	if !known {
 		return flowcontrol.DispatchAdmit
 	}
-	req := placement.Request{ID: fcReq.ID(), PromptTokens: promptTokens, MaxTokens: capacity.MaxTokens(request)}
+	req := placement.Request{
+		ID:           fcReq.ID(),
+		Token:        placement.ReservationToken(request),
+		PromptTokens: promptTokens,
+		MaxTokens:    capacity.MaxTokens(request),
+	}
 	long := p.policy.IsLong(promptTokens)
 
 	opts := placement.Options{LateBinding: true}
@@ -238,9 +248,9 @@ func (p *pass) Admit(_ context.Context, item flowcontrol.QueueItemAccessor) flow
 	return flowcontrol.DispatchAdmit
 }
 
-// Revert releases the charge Bind made for item. Releasing an unbound request is a no-op.
+// Revert releases the lease Bind took for item. Unbinding an unbound request is a no-op.
 func (p *pass) Revert(item flowcontrol.QueueItemAccessor) {
-	p.gate.binder.Tracker().Release(item.OriginalRequest().ID())
+	p.gate.binder.Unbind(item.OriginalRequest().InferenceRequest())
 }
 
 // reserveFor returns the blocks a context of contextTokens needs on every large endpoint that could ever hold it:
