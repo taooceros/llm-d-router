@@ -82,6 +82,11 @@ Tuning knobs, all under the `flowControl:` config section:
   admission ceiling for low-priority traffic as utilization rises, so that traffic waits in queue
   rather than being rejected; it sheds only by way of the two limits above. Configure it via
   `usageLimitPolicyPluginRef`.
+* A saturation detector that also implements `DispatchGate`
+  (`pkg/epp/framework/interface/flowcontrol/dispatchgate.go`) decides dispatch per request instead of by a pool
+  scalar. Each dispatch cycle then visits every queued item of an open band in the band's ordering-policy order and
+  dispatches each item the gate admits; an item the gate refuses stays queued without blocking the items behind it.
+  Fairness policies are not consulted in this mode. The `hetero-late-binding-gate` plugin is such a detector.
 
 ### High Level Architecture
 

@@ -23,6 +23,42 @@ from .discovery import DEFAULT_POOL_NAME, DiscoveryBridge
 from .extproc import EXTPROC_PORT, PROTOCOL_VERSION, ExtProcServer
 from .policy import RoutingPolicy
 
+
+_WATCHDOG_STARTED = False
+
+
+def _start_loop_watchdog(loop: asyncio.AbstractEventLoop, stall_s: float = 2.0) -> None:
+    """Report the loop thread's stack whenever the gateway event loop stops responding.
+
+    ExtProc gRPC, HTTP and migration control share this loop; a blocked loop
+    makes Envoy's connect timeout fail requests that never reach the gateway.
+    """
+    global _WATCHDOG_STARTED
+    if _WATCHDOG_STARTED:
+        return
+    _WATCHDOG_STARTED = True
+    import sys
+    import threading
+    import traceback
+
+    loop_thread = threading.get_ident()
+
+    def watch() -> None:
+        while not loop.is_closed():
+            answered = threading.Event()
+            loop.call_soon_threadsafe(answered.set)
+            if answered.wait(stall_s):
+                time.sleep(0.5)
+                continue
+            started = time.monotonic()
+            frame = sys._current_frames().get(loop_thread)
+            stack = "".join(traceback.format_stack(frame)[-14:]) if frame else "unavailable"
+            answered.wait()
+            emit_event("GATEWAY_LOOP_STALL", stalled_s=round(stall_s + time.monotonic() - started, 3),
+                       stack=stack[-3000:])
+
+    threading.Thread(target=watch, name="omp-gateway-loop-watchdog", daemon=True).start()
+
 GATEWAY_ACTOR_NAME = "omp-hetero-gateway"
 GATEWAY_PORT = 8200
 
@@ -69,6 +105,16 @@ def build_app(gateway: "GatewayActorState") -> Any:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
         except RuntimeError as exc:
             raise HTTPException(status_code=503, detail=str(exc)) from exc
+        except asyncio.CancelledError:
+            emit_event("GATEWAY_DISPATCH_CANCELLED", request_id=body.get("request_id"))
+            raise
+        except Exception as exc:
+            # Never an anonymous 500: the cause is the first thing to debug.
+            import traceback
+            emit_event("GATEWAY_DISPATCH_ERROR", request_id=body.get("request_id"),
+                       error=f"{type(exc).__name__}: {exc}",
+                       traceback="".join(traceback.format_exc())[-1500:])
+            raise HTTPException(status_code=500, detail=f"{type(exc).__name__}: {exc}") from exc
         return {
             "id": record["request_id"],
             "object": "text_completion",
@@ -401,6 +447,7 @@ class OmpGateway:
         self.state._refresh_task = asyncio.create_task(self._refresh_loop())
         self.state._discovery_task = asyncio.create_task(self._discovery_loop())
         self.state._migration_task = asyncio.create_task(self._migration_loop())
+        _start_loop_watchdog(asyncio.get_running_loop())
         return {"started": True, "host": self.node_ip, "port": self.port,
                 "extproc_port": EXTPROC_PORT, "protocol": PROTOCOL_VERSION}
 

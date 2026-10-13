@@ -15,6 +15,7 @@ import time
 import uuid
 from typing import Any, Dict, List, Optional, Tuple
 
+from ..evidence import emit_event
 from .policy import Candidate, CentralScheduler, RoutingPolicy, blocks_for
 from .state import (
     COMMITTED_STATES, TERMINAL_STATES, GatewayState, OwnershipState, TransactionState,
@@ -775,6 +776,8 @@ class GatewayCore:
         await self.recover()
         for row in self.state.transactions():
             if row["unresolved"]:
+                emit_event("GATEWAY_RECOVERING_TRANSACTION", transaction=row["transaction_id"],
+                           state=row["state"], unresolved=str(row["unresolved"])[:500])
                 await self._execute(row["transaction_id"], recovering=True)
         status = self.recovery_status()
         if not status["ready"]:
