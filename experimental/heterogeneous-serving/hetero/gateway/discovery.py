@@ -26,6 +26,20 @@ DEFAULT_POOL_NAME = "omp-hetero"
 INSTANCE_LABEL = "omp.llm-d.ai/instance-id"
 GENERATION_LABEL = "omp.llm-d.ai/generation"
 LAYOUT_LABEL = "omp.llm-d.ai/layout"
+# Endpoint facts the llm-d EPP hetero plugins read (role never from instance lists).
+ROLE_LABEL = "omp.llm-d.ai/role"
+TP_LABEL = "omp.llm-d.ai/tp"
+MAX_MODEL_LEN_LABEL = "omp.llm-d.ai/max-model-len"
+IDENTITY_LABELS = (INSTANCE_LABEL, GENERATION_LABEL, LAYOUT_LABEL,
+                   ROLE_LABEL, TP_LABEL, MAX_MODEL_LEN_LABEL)
+
+
+def instance_role(instance_id: str) -> str:
+    """Layout naming is the role contract: ``small*`` is TP8, ``large*`` is TP16."""
+    for role in ("small", "large"):
+        if instance_id.startswith(role):
+            return role
+    raise RuntimeError(f"instance id has no small/large role: {instance_id}")
 
 
 class InClusterKube:
@@ -182,12 +196,18 @@ class DiscoveryBridge:
                 raise RuntimeError(f"endpoint is not the rank-zero coordinator: {instance_id}")
             if not row.get("layout_id") or not isinstance(row.get("generation"), int):
                 raise RuntimeError(f"missing logical generation identity: {instance_id}")
+            instance_role(instance_id)
+            if not all(isinstance(row.get(key), int) and row[key] > 0
+                       for key in ("tp_size", "max_model_len")):
+                raise RuntimeError(f"missing tp_size/max_model_len serving facts: {instance_id}")
         return rows
 
     @staticmethod
     def _identity(record: Dict[str, Any]) -> Dict[str, str]:
         return {INSTANCE_LABEL: record["instance_id"],
-                GENERATION_LABEL: str(record["generation"]), LAYOUT_LABEL: record["layout_id"]}
+                GENERATION_LABEL: str(record["generation"]), LAYOUT_LABEL: record["layout_id"],
+                ROLE_LABEL: instance_role(record["instance_id"]),
+                TP_LABEL: str(record["tp_size"]), MAX_MODEL_LEN_LABEL: str(record["max_model_len"])}
 
     def resolve(
         self, registry_rows: List[Dict[str, Any]], *,
@@ -277,7 +297,6 @@ class DiscoveryBridge:
         removed = []
         for row in current:
             if row["pod"] not in wanted:
-                self.kube.label_pod(row["pod"], {key: None for key in (
-                    *match_labels, INSTANCE_LABEL, GENERATION_LABEL, LAYOUT_LABEL)})
+                self.kube.label_pod(row["pod"], {key: None for key in (*match_labels, *IDENTITY_LABELS)})
                 removed.append({"pod": row["pod"], "pod_ip": row["pod_ip"], "unlabelled": True})
         return {"applied": applied, "removed_stale": removed}

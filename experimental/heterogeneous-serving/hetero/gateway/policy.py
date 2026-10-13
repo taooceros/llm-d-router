@@ -30,9 +30,17 @@ class RoutingPolicy:
     # Initial placement
     small_instances: Tuple[str, ...] = ()
     large_instances: Tuple[str, ...] = ()
+    # Prompts longer than this are long requests; see long_reserve_blocks.
     small_prompt_token_limit: int = 4096
     large_fresh_traffic_share: float = 0.25
     reserve_large_headroom_blocks: int = 64
+    # KV tokens on every large instance that short requests may not take, so a
+    # long request is not starved by a backlog of short ones.  0 disables.
+    # Tokens, not blocks: block size differs between engines.
+    long_reserve_tokens: int = 0
+    # When the preferred pool has no admissible room, try the other pool
+    # instead of waiting for the preferred one.
+    work_conserving_fallback: bool = False
     # Migration
     migration_enabled: bool = False
     migration_mechanism: str = "recompute"
@@ -44,6 +52,23 @@ class RoutingPolicy:
     max_inflight_migrations_total: int = 3
     destination_growth_allowance_blocks: int = 8
     source_pressure_free_block_fraction: float = 0.15
+    # Decode-length-blind scheduling: prompt length is known and used, but never the decode budget
+    # (max_tokens) for placement, admission accounting or migration. The
+    # engine still enforces max_tokens as a stop condition only.
+    decode_length_blind: bool = False
+    admission_growth_blocks: int = 1
+    # Late binding (work steering): requests wait in one gateway queue and are
+    # bound to an engine only when one has room.  "arrival" keeps today's
+    # order; "longest_prompt_first" serves the longest known prompt first.
+    dispatch_order: str = "arrival"
+    # Hold KV back on a large instance only while a long request that does not
+    # yet fit is waiting, sized to that request, instead of the static
+    # long_reserve_tokens.  Requires late binding.
+    dynamic_long_reserve: bool = False
+    # --- late-binding knobs (owner: late-binding work) ---
+    # --- work-stealing knobs (owner: work-stealing work) ---
+    # Move requests an engine is holding but not running to an engine with room.
+    steal_enabled: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         return dataclasses.asdict(self)
@@ -108,6 +133,11 @@ class CentralScheduler:
         self._fresh_dispatched = 0
         self._fresh_to_large = 0
 
+    def reset_fresh_traffic(self) -> None:
+        """Zero the fresh-traffic share counters (a membership change starts a new quota)."""
+        self._fresh_dispatched = 0
+        self._fresh_to_large = 0
+
     # -------------------------------------------------- initial placement
 
     def select_initial(
@@ -119,13 +149,18 @@ class CentralScheduler:
     ) -> Tuple[Optional[str], Dict[str, Any]]:
         """Chooses the instance for a fresh request, or refuses with a reason."""
         policy = self.policy
-        context = prompt_tokens + max_tokens
+        if policy.decode_length_blind:
+            # Only the prompt is known; charge one growth allowance on top.
+            context = prompt_tokens + policy.admission_growth_blocks * _block_size(candidates)
+        else:
+            context = prompt_tokens + max_tokens
         by_id = {c.instance_id: c for c in candidates}
         eligible = [c for c in candidates if c.max_model_len >= context]
         trace: Dict[str, Any] = {
             "phase": "initial",
             "prompt_tokens": prompt_tokens,
-            "max_tokens": max_tokens,
+            "max_tokens": None if policy.decode_length_blind else max_tokens,
+            "decode_length_blind": policy.decode_length_blind,
             "context": context,
             "considered": [c.instance_id for c in candidates],
             "eligible": [c.instance_id for c in eligible],
@@ -152,16 +187,25 @@ class CentralScheduler:
         trace["work_conserving_large"] = want_large
 
         if not fits_small:
-            pool = large or eligible
+            pools = [large or eligible]
             trace["reason"] = "prompt_does_not_fit_a_small_instance"
         elif want_large:
-            pool = large or fits_small
+            pools = [large or fits_small, fits_small]
             trace["reason"] = "large_fresh_traffic_share"
         else:
-            pool = fits_small
+            pools = [fits_small, large]
             trace["reason"] = "prefer_small"
+        if not policy.work_conserving_fallback:
+            pools = pools[:1]
 
-        pool = [c for c in pool if _has_room(c, context, policy)]
+        long_request = prompt_tokens > policy.small_prompt_token_limit
+        pool: List[Candidate] = []
+        for index, option in enumerate(pools):
+            pool = [c for c in option if _has_room(c, context, policy, long_request)]
+            if pool:
+                if index:
+                    trace["fallback"] = True
+                break
         if not pool:
             trace["refusal"] = "no_destination_has_admissible_capacity"
             return None, trace
@@ -201,7 +245,7 @@ class CentralScheduler:
             "source": source_instance,
             "prompt_tokens": prompt_tokens,
             "generated_tokens": generated_tokens,
-            "remaining_tokens": remaining_tokens,
+            "remaining_tokens": None if policy.decode_length_blind else remaining_tokens,
             "source_free_fraction": round(source_free_fraction, 5),
         }
         if not policy.migration_enabled:
@@ -224,7 +268,7 @@ class CentralScheduler:
         if context < policy.min_context_tokens:
             trace["refusal"] = "below_context_threshold"
             return None, trace, {}
-        if remaining_tokens < policy.min_remaining_tokens:
+        if not policy.decode_length_blind and remaining_tokens < policy.min_remaining_tokens:
             trace["refusal"] = "insufficient_remaining_budget"
             return None, trace, {}
         if source_free_fraction > policy.source_pressure_free_block_fraction:
@@ -236,7 +280,7 @@ class CentralScheduler:
             for c in candidates
             if c.instance_id in policy.large_instances
             and c.instance_id != source_instance
-            and c.max_model_len >= context + remaining_tokens
+            and c.max_model_len >= context + (1 if policy.decode_length_blind else remaining_tokens)
         ]
         trace["destinations_considered"] = [c.instance_id for c in destinations]
         if not destinations:
@@ -248,10 +292,13 @@ class CentralScheduler:
         viable = []
         for candidate in destinations:
             need = blocks_for(context, candidate.block_size)
-            grow = max(
-                policy.destination_growth_allowance_blocks,
-                blocks_for(remaining_tokens, candidate.block_size),
-            )
+            if policy.decode_length_blind:
+                grow = policy.destination_growth_allowance_blocks
+            else:
+                grow = max(
+                    policy.destination_growth_allowance_blocks,
+                    blocks_for(remaining_tokens, candidate.block_size),
+                )
             if candidate.admissible_blocks < need + grow:
                 continue
             if candidate.inflight_migrations >= policy.max_inflight_migrations_per_destination:
@@ -271,11 +318,16 @@ class CentralScheduler:
         return candidate.instance_id, trace, {"blocks": blocks, "growth_blocks": growth}
 
 
-def _has_room(candidate: Candidate, context: int, policy: RoutingPolicy) -> bool:
+def _block_size(candidates: Sequence["Candidate"]) -> int:
+    return max((c.block_size for c in candidates), default=256)
+
+
+def _has_room(candidate: Candidate, context: int, policy: RoutingPolicy,
+              long_request: bool) -> bool:
     need = blocks_for(context, candidate.block_size)
-    headroom = (
-        policy.reserve_large_headroom_blocks
-        if candidate.instance_id in policy.large_instances
-        else 0
-    )
+    headroom = 0
+    if candidate.instance_id in policy.large_instances:
+        headroom = policy.reserve_large_headroom_blocks
+        if not long_request:
+            headroom += blocks_for(policy.long_reserve_tokens, candidate.block_size)
     return candidate.admissible_blocks - headroom >= need

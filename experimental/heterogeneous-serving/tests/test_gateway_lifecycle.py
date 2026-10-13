@@ -9,6 +9,8 @@ import copy
 import inspect
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -335,6 +337,59 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(RuntimeError):
             await self.gateway.reconcile()
         self.assertEqual((await self.completion("missing-peer"))[0], 503)
+
+
+class ExtProcLoopIsolationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_streams_are_accepted_while_the_gateway_loop_is_saturated(self):
+        # grpc.aio accepts one call per loop round trip and gRPC core cancels
+        # calls left unaccepted for 30 s. On the saturated W0 gateway loop that
+        # turned Envoy streams into 500s the gateway never saw.
+        async def echo(scope, receive, send):
+            body, more = b"", True
+            while more:
+                message = await receive()
+                body, more = body + message.get("body", b""), message.get("more_body", False)
+            await send({"type": "http.response.start", "status": 200,
+                        "headers": [(b"content-type", b"application/json")]})
+            await send({"type": "http.response.body", "body": body})
+
+        server = ExtProcServer(echo, host="127.0.0.1", port=0)
+        await server.start()
+        acknowledged = threading.Event()
+        payload = json.dumps({"request_id": "saturated-loop"}).encode()
+
+        def envoy():
+            def messages():
+                yield ext.ProcessingRequest(request_headers=ext.HttpHeaders(headers=base_pb2.HeaderMap(headers=[
+                    base_pb2.HeaderValue(key=":method", value="POST"),
+                    base_pb2.HeaderValue(key=":path", value="/v1/completions"),
+                ])))
+                acknowledged.wait(30)
+                yield ext.ProcessingRequest(request_body=ext.HttpBody(body=payload, end_of_stream=True))
+
+            with grpc.insecure_channel(f"127.0.0.1:{server.port}") as channel:
+                responses = ext_grpc.ExternalProcessorStub(channel).Process(messages(), timeout=30)
+                first = next(responses)
+                acknowledged.set()
+                return first, list(responses)
+
+        try:
+            client = asyncio.ensure_future(asyncio.to_thread(envoy))
+            await asyncio.sleep(0)
+            # Hold the gateway loop (and the GIL, between forced switches).
+            deadline = time.monotonic() + 5
+            while not acknowledged.is_set() and time.monotonic() < deadline:
+                pass
+            self.assertTrue(acknowledged.is_set(), "ExtProc stream waited on the gateway loop")
+            first, rest = await client
+        finally:
+            acknowledged.set()
+            await server.stop()
+        self.assertTrue(first.HasField("request_headers"))
+        immediate = rest[-1].immediate_response
+        marker = {h.header.key: h.header.raw_value.decode() for h in immediate.headers.set_headers}
+        self.assertEqual((immediate.status.code, immediate.body, marker[PROTOCOL_HEADER]),
+                         (200, payload, PROTOCOL_VERSION))
 
 
 class DrainDeletionTests(unittest.TestCase):

@@ -4,7 +4,8 @@ import copy
 import unittest
 
 from hetero.gateway.discovery import (
-    DiscoveryBridge, GENERATION_LABEL, INSTANCE_LABEL, LAYOUT_LABEL, InClusterKube,
+    DiscoveryBridge, GENERATION_LABEL, INSTANCE_LABEL, LAYOUT_LABEL, MAX_MODEL_LEN_LABEL,
+    ROLE_LABEL, TP_LABEL, InClusterKube,
 )
 
 
@@ -56,7 +57,7 @@ class DiscoveryTests(unittest.TestCase):
                     "endpoint": "10.0.0.1:8000", "endpoint_host": "10.0.0.1", "endpoint_port": 8000,
                     "host_chip_rank_map": [{"process_rank": 0, "node_ip": "10.0.0.1"},
                                            {"process_rank": 1, "node_ip": "10.0.0.2"}],
-                    "state": "ready", "routable": True, "tp_size": 8}
+                    "state": "ready", "routable": True, "tp_size": 8, "max_model_len": 16384}
 
     def test_coordinator_generation_changes_without_changing_endpoint(self):
         self.bridge.bind_labels([self.row])
@@ -86,6 +87,23 @@ class DiscoveryTests(unittest.TestCase):
         self.bridge.bind_labels([self.row])
         self.assertFalse(self.bridge.resolve([self.row])["ready"])
         self.assertEqual(self.bridge.endpoints(), [])
+
+    def test_epp_serving_facts_are_published_tracked_and_withdrawn(self):
+        self.bridge.bind_labels([self.row])
+        labels = self.kube.pods[1]["metadata"]["labels"]
+        self.assertEqual((labels[ROLE_LABEL], labels[TP_LABEL], labels[MAX_MODEL_LEN_LABEL]),
+                         ("small", "8", "16384"))
+        # A redeploy with a longer context must not leave the EPP reading a stale limit.
+        self.row["max_model_len"] = 36864
+        self.assertFalse(self.bridge.resolve([self.row])["ready"])
+        self.bridge.bind_labels([self.row])
+        self.assertTrue(self.bridge.resolve([self.row])["ready"])
+        self.assertEqual(labels[MAX_MODEL_LEN_LABEL], "36864")
+        self.row.update(state="draining", routable=False)
+        self.bridge.bind_labels([self.row])
+        self.assertFalse({ROLE_LABEL, TP_LABEL, MAX_MODEL_LEN_LABEL} & set(labels))
+        with self.assertRaises(RuntimeError):
+            self.bridge.bind_labels([{**self.row, "instance_id": "medium", "state": "ready"}])
 
     def test_maintenance_removes_target_labels_but_never_ignores_stale_addresses(self):
         peer = {**self.row, "instance_id": "small_b", "endpoint_host": "10.0.0.2",
