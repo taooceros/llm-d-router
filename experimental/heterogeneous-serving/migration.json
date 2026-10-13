@@ -21,8 +21,8 @@
     },
     {
       "path": "hetero/gateway/extproc.py",
-      "sha256": "2228be1f10382321babf34da12a7543d41baa0ba485fb6fc24479e69d0db919c",
-      "bytes": 11726
+      "sha256": "e5d6a5f656cb4078132af0403b4e18b76acb0443ea28c21bc08cd43afabed1d7",
+      "bytes": 12926
     },
     {
       "path": "hetero/gateway/lifecycle.py",
@@ -36,8 +36,8 @@
     },
     {
       "path": "hetero/gateway/service.py",
-      "sha256": "c804e479e76b9121dbce5995040af24aa3627cbb94ef36e73c7ce13308a0a8a9",
-      "bytes": 38840
+      "sha256": "1e5ae1f5ebfaa7871a18fff25afb1d3a4b87611097acfcfd9d7aca73a5c6d43b",
+      "bytes": 39942
     },
     {
       "path": "hetero/gateway/state.py",
@@ -58,6 +58,11 @@
       "path": "tests/test_gateway_lifecycle.py",
       "sha256": "380643715c4a70ec8336f54efc473460e62a37d6873cf151ccce93abfaf45d0a",
       "bytes": 22185
+    },
+    {
+      "path": "tests/test_ingress_failure_signature.py",
+      "sha256": "80488c20bd814d13c2da43efd6b0193dda76784c3700eb2ef05ae4dfaeb3560f",
+      "bytes": 8641
     },
     {
       "path": "tests/test_length_blind_policy.py",

@@ -89,8 +89,12 @@ def build_app(gateway: "GatewayActorState") -> Any:
 
     @app.post("/v1/completions")
     async def completions(request: Request) -> Dict[str, Any]:
-        if not gateway.discovery_snapshot().get("ready", False):
-            raise HTTPException(status_code=503, detail="logical-instance discovery is not ready")
+        discovery = gateway.discovery_snapshot()
+        if not discovery.get("ready", False):
+            # The reason (lease expiry versus a failed reconcile) is the client's
+            # only evidence of why admission was refused before any trace row.
+            raise HTTPException(status_code=503, detail=f"logical-instance discovery is not ready: "
+                                                        f"{str(discovery.get('error'))[:300]}")
         try:
             body = await request.json()
         except ValueError as exc:
@@ -179,8 +183,9 @@ class GatewayActorState:
         return self._discovery
 
     async def dispatch(self, request: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.discovery_snapshot().get("ready"):
-            raise RuntimeError("logical-instance discovery is not ready")
+        discovery = self.discovery_snapshot()
+        if not discovery.get("ready"):
+            raise RuntimeError(f"logical-instance discovery is not ready: {str(discovery.get('error'))[:300]}")
         self.active_requests += 1
         try:
             return await self.core.dispatch(request)
@@ -663,6 +668,7 @@ class OmpGateway:
             "serving": self.state._task is not None and not self.state._task.done(),
             "extproc_port": EXTPROC_PORT,
             "extproc_serving": self.state._extproc is not None,
+            "extproc_aborts": self.state._extproc.aborts() if self.state._extproc is not None else None,
             "protocol": PROTOCOL_VERSION,
             "layout_id": self.config.layout_id,
             "joining": sorted(self.state.joining),
@@ -675,6 +681,18 @@ class OmpGateway:
             ),
             "core": self.state.core.snapshot(),
             "discovery": self.state.discovery_snapshot(),
+        }
+
+    def routing_status(self) -> Dict[str, Any]:
+        """Light read-only routing view (no core snapshot): what a gate or pre-flight needs."""
+        return {
+            "layout_id": self.config.layout_id,
+            "instances": sorted(self.state.core.descriptors()),
+            "joining": sorted(self.state.joining),
+            "maintenance_instances": sorted(self.state.maintenance.get("instances", {})),
+            "discovery_ready": bool(self.state.discovery_snapshot().get("ready")),
+            "serving": self.state._task is not None and not self.state._task.done(),
+            "capturing": self.state.capturing,
         }
 
     async def await_idle_instances(self, timeout_s: float = 300.0) -> Dict[str, Any]:

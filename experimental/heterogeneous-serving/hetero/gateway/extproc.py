@@ -27,8 +27,10 @@ There is no invented llm-d plugin or independent EPP placement policy here.
 from __future__ import annotations
 
 import asyncio
+import collections
 import concurrent.futures
 import threading
+import time
 from typing import Any, AsyncIterator, Optional
 
 import grpc
@@ -61,6 +63,23 @@ class GatewayExternalProcessor(ext_grpc.ExternalProcessorServicer):
             timeout=None,
             follow_redirects=False,
         )
+        # Envoy reports every stream this processor aborts as a bodiless HTTP 500
+        # with upstream "-", indistinguishable from a transport failure. Keep the
+        # gateway's side of that signature where run artifacts can read it.
+        self._aborts_lock = threading.Lock()
+        self._aborts: collections.deque = collections.deque(maxlen=64)
+        self._abort_count = 0
+
+    def _record_abort(self, code: grpc.StatusCode, exc: BaseException) -> None:
+        with self._aborts_lock:
+            self._abort_count += 1
+            self._aborts.append({"at_s": time.time(), "code": code.name,
+                                 "error": f"{type(exc).__name__}: {exc}"[:300]})
+
+    def aborts(self) -> dict:
+        """Streams aborted by this processor (Envoy answers them 500, upstream "-")."""
+        with self._aborts_lock:
+            return {"count": self._abort_count, "recent": list(self._aborts)}
 
     async def close(self) -> None:
         await self.client.aclose()
@@ -160,6 +179,7 @@ class GatewayExternalProcessor(ext_grpc.ExternalProcessorServicer):
         except asyncio.CancelledError:
             raise
         except ValueError as exc:
+            self._record_abort(grpc.StatusCode.INVALID_ARGUMENT, exc)
             await context.abort(grpc.StatusCode.INVALID_ARGUMENT, str(exc))
         except Exception as exc:
             # Never close an incomplete stream with OK: Envoy would then bypass
@@ -168,6 +188,7 @@ class GatewayExternalProcessor(ext_grpc.ExternalProcessorServicer):
             from ..evidence import emit_event
             emit_event("GATEWAY_EXTPROC_ERROR", error=f"{type(exc).__name__}: {exc}"[:500],
                        traceback=traceback.format_exc()[-2500:])
+            self._record_abort(grpc.StatusCode.INTERNAL, exc)
             await context.abort(grpc.StatusCode.INTERNAL,
                                 f"gateway ExtProc processing failed: {type(exc).__name__}")
 
@@ -222,6 +243,9 @@ class ExtProcServer:
         # Active handlers are cancelled after the grace period; cancellation
         # reaches the same core as direct HTTP dispatch on the gateway loop.
         await server.stop(grace=30)
+
+    def aborts(self) -> Optional[dict]:
+        return self.processor.aborts() if self.processor is not None else None
 
     async def stop(self) -> None:
         if self._thread is not None:
