@@ -113,6 +113,7 @@ class MigrationTransaction:
     source_generation: int = 0
     destination_generation: int = 0
     max_context_tokens: int = 0
+    reserve_tokens: int = 0
     state: TransactionState = TransactionState.RESERVED
     created_at: float = dataclasses.field(default_factory=time.time)
     updated_at: float = dataclasses.field(default_factory=time.time)
@@ -412,6 +413,7 @@ class GatewayState:
         self, *, request_id: str, source_instance: str, destination_instance: str,
         mechanism: str, blocks: int, growth_blocks: int, destination_generation: int,
         max_inflight_per_destination: int, max_context_tokens: int = 0,
+        reserve_tokens: int = 0,
     ) -> Tuple[Optional[MigrationTransaction], Optional[str]]:
         with self._lock:
             self.ensure_healthy()
@@ -452,6 +454,8 @@ class GatewayState:
                 source_generation=owner.instance_generation,
                 destination_generation=destination_generation,
                 max_context_tokens=max_context_tokens or (blocks + growth_blocks) * capacity.block_size,
+                reserve_tokens=min(reserve_tokens, max_context_tokens) if reserve_tokens and max_context_tokens
+                else reserve_tokens,
             )
             txn.mark(TransactionState.RESERVED)
             self._transactions[transaction_id] = txn
@@ -647,6 +651,25 @@ class GatewayState:
     def transactions(self) -> List[Dict[str, Any]]:
         with self._lock:
             return [t.to_dict() for t in self._transactions.values()]
+
+    # The two readers below sit on every admission poll. They never copy a
+    # transaction: to_dict() deep-copies each retained snapshot's prompt and
+    # generated token ids, and per-poll copies saturated the event loop that
+    # serves Envoy's ExtProc streams as soon as one migration was retained.
+
+    def inflight_migrations_by_destination(self) -> Dict[str, int]:
+        with self._lock:
+            counts: Dict[str, int] = {}
+            for txn in self._transactions.values():
+                if txn.state not in TERMINAL_STATES:
+                    counts[txn.destination_instance] = counts.get(txn.destination_instance, 0) + 1
+            return counts
+
+    def unresolved_transactions(self) -> List[Dict[str, str]]:
+        with self._lock:
+            return [{"transaction_id": t.transaction_id, "state": t.state.value,
+                     "unresolved": t.unresolved}
+                    for t in self._transactions.values() if t.unresolved]
 
     def counters(self) -> Dict[str, int]:
         with self._lock:

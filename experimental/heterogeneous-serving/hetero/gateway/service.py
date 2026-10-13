@@ -30,8 +30,8 @@ _WATCHDOG_STARTED = False
 def _start_loop_watchdog(loop: asyncio.AbstractEventLoop, stall_s: float = 2.0) -> None:
     """Report the loop thread's stack whenever the gateway event loop stops responding.
 
-    ExtProc gRPC, HTTP and migration control share this loop; a blocked loop
-    makes Envoy's connect timeout fail requests that never reach the gateway.
+    HTTP, ExtProc dispatch and migration control share this loop (ExtProc
+    stream acceptance runs on its own loop, see ExtProcServer).
     """
     global _WATCHDOG_STARTED
     if _WATCHDOG_STARTED:
@@ -169,6 +169,9 @@ class GatewayActorState:
         self.administration_lock = asyncio.Lock()
         self.maintenance: Dict[str, Any] = {}
         self.maintenance_clients: Dict[str, Any] = {}
+        # Instances of the current layout that are deploying but must stay out of
+        # discovery, binding and routing until join_instances() publishes them.
+        self.joining: set = set()
 
     def discovery_snapshot(self) -> Dict[str, Any]:
         if self._discovery.get("ready") and time.monotonic() >= self.discovery_expires_at:
@@ -234,6 +237,7 @@ class OmpGateway:
 
     async def _reconcile(
         self, *, bind_labels: bool, observe_only: bool = False, restore: bool = False,
+        joined: frozenset = frozenset(),
     ) -> Dict[str, Any]:
         rows = []
         try:
@@ -247,7 +251,8 @@ class OmpGateway:
                 raise RuntimeError("registered static layout is missing")
             expected = {row["instance_id"] for row in layout["instances"]}
             maintenance = self.state.maintenance
-            excluded = set(maintenance.get("instances", {})) if not restore else set()
+            joining = set(self.state.joining) - set(joined)
+            excluded = (set(maintenance.get("instances", {})) if not restore else set()) | joining
             active = [row for row in rows if row["instance_id"] not in excluded]
             if ({row["instance_id"] for row in active} != expected - excluded
                     or not excluded <= expected
@@ -259,7 +264,13 @@ class OmpGateway:
                        != {row["instance_id"]: self._binding(row) for row in active})
             if changed and observe_only:
                 raise RuntimeError("engine identity changed; explicit idle reconciliation is required")
-            if changed and before:
+            if joined:
+                live_names = {row["instance_id"] for row in active}
+                if (live_names - set(before) != set(joined) or set(before) - live_names
+                        or any(self._binding(row) != self._binding(before[row["instance_id"]])
+                               for row in active if row["instance_id"] in before)):
+                    raise RuntimeError("joining must be purely additive to the live bindings")
+            if changed and before and not joined:
                 self._require_idle()
             if maintenance:
                 for row in active:
@@ -311,7 +322,7 @@ class OmpGateway:
             if not active and discovery["pod_endpoint_count"]:
                 raise RuntimeError("maintenance left labelled endpoints without an active instance")
             if changed:
-                if before or restore:
+                if (before or restore) and not joined:
                     self._require_idle()
                 # A new generation must never inherit the previous KV-capacity sample.
                 for name, status in statuses.items():
@@ -324,7 +335,17 @@ class OmpGateway:
                             resident_growth_allowance=self.state.core._growth_allowance(status),
                             sample_started_at=sampled_at,
                         )
-                self.state.core.bind_instances(active, actors)
+                if joined:
+                    fresh = [row for row in active if row["instance_id"] in joined]
+                    if self.state.capturing:
+                        # A joiner records its iterations from its first request.
+                        await asyncio.gather(*[self.state.core._rpc(
+                            actors[row["instance_id"]].start_iteration_capture.remote(),
+                            timeout_s=30.0 + self.config.rpc_timeout_s) for row in fresh])
+                    self.state.core.add_instances(
+                        fresh, {row["instance_id"]: actors[row["instance_id"]] for row in fresh})
+                else:
+                    self.state.core.bind_instances(active, actors)
             self.state.discovery_expires_at = sampled_at + min(
                 [self.config.health_lease_s]
                 + [max(0.0, self.config.health_lease_s - row.get("health_age_s", 0.0)) for row in active]
@@ -339,6 +360,8 @@ class OmpGateway:
     async def begin_maintenance(self, instance_ids: List[str], *, reason: str) -> Dict[str, Any]:
         """Fence selected admissions between workloads; peers keep the same core."""
         async with self.state.administration_lock:
+            if self.state.joining:
+                raise RuntimeError("cannot begin maintenance while instances are joining")
             names = set(instance_ids)
             if not names or not reason.strip():
                 raise ValueError("maintenance requires explicit instances and an operator reason")
@@ -414,6 +437,120 @@ class OmpGateway:
             self.state.maintenance = {}
             self.state.maintenance_clients = {}
             return result
+
+    async def retarget_layout(self, new_layout_id: str, joining_ids: List[str]) -> Dict[str, Any]:
+        """Adopt another layout after a scoped drain; its new instances are held out as 'joining'.
+
+        The kept engines must already be registered under ``new_layout_id``; the
+        released ones drained and withdrawn.  Joiners are fenced from discovery
+        before the caller deploys (and thus registers) them.
+        """
+        async with self.state.administration_lock:
+            maintenance = self.state.maintenance
+            joining = set(joining_ids)
+            if self.state.joining or not joining or not maintenance or new_layout_id == self.config.layout_id:
+                raise RuntimeError("retarget requires declared maintenance, a new layout and a joining set")
+            self._require_idle()
+            if set(maintenance["drained"]) != set(maintenance["instances"]):
+                raise RuntimeError("retarget requires every maintained instance to be drained")
+            registry = find_registry()
+            if registry is None:
+                raise RuntimeError("serving-instance registry actor is not present")
+            rows = await self.state.core._rpc(registry.snapshot.remote(None))
+            live = {(row["instance_id"], row["generation"]) for row in rows}
+            if any((name, original["generation"]) in live
+                   for name, original in maintenance["instances"].items()):
+                raise RuntimeError("retarget requires the released instances withdrawn from the registry")
+            layout = await self.state.core._rpc(registry.get_layout.remote(new_layout_id))
+            if not layout:
+                raise RuntimeError("target layout is not registered")
+            expected = {row["instance_id"] for row in layout["instances"]}
+            if not joining <= expected or set(self.state.core.clients) != expected - joining:
+                raise RuntimeError("kept engines and the joining set must exactly partition the target layout")
+            previous = (self.config.layout_id, maintenance, self.state.maintenance_clients)
+            self.config.layout_id = new_layout_id
+            self.state.maintenance, self.state.maintenance_clients = {}, {}
+            self.state.joining = joining
+            try:
+                result = await self._reconcile(bind_labels=True)
+            except Exception:
+                self.config.layout_id, self.state.maintenance, self.state.maintenance_clients = previous
+                self.state.joining = set()
+                raise
+            return {**result, "layout_id": new_layout_id, "joining": sorted(joining),
+                    "retargeted_at": time.time()}
+
+    async def join_instances(
+        self, instance_ids: List[str], policy_after: Optional[Dict[str, Any]] = None,
+    ) -> Dict[str, Any]:
+        """Publish deployed joiners additively; live bindings and in-flight work are untouched.
+
+        Deliberately not idle-gated: the point is to add capacity mid-workload.
+        A failed join leaves the previous discovery verdict (and traffic) intact.
+        """
+        ids = frozenset(instance_ids)
+        # A freshly started coordinator pod can report Ready=False for a few seconds after its
+        # engine is up. Labelling it then fails the join *and* leaves a labelled, unready
+        # endpoint that fails discovery closed for live traffic, so wait first -- outside the
+        # administration lock, which the discovery loop needs to keep its health lease fresh.
+        await self._await_joiner_pods_ready(ids)
+        async with self.state.administration_lock:
+            if not ids or not ids <= self.state.joining or self.state.maintenance:
+                raise RuntimeError("join names instances that are not joining this layout")
+            prior = (self.state._discovery, self.state.discovery_expires_at)
+            try:
+                result = await self._reconcile(bind_labels=True, joined=ids)
+            except Exception:
+                self.state._discovery, self.state.discovery_expires_at = prior
+                # The failed attempt may already have labelled joiner pods; a labelled endpoint
+                # outside the bindings fails discovery closed, so withdraw it (joiners are still
+                # excluded, live bindings are unchanged, so this is not idle-gated).
+                try:
+                    await self._reconcile(bind_labels=True)
+                except Exception:  # noqa: BLE001 - the original failure is the one to report
+                    pass
+                raise
+            self.state.joining -= ids
+            names = set(self.state.core.clients)
+            roles = {"small_instances": sorted(n for n in names if n.startswith("small")),
+                     "large_instances": sorted(n for n in names if n.startswith("large"))}
+            merged = {**self.config.policy.to_dict(), **(policy_after or {}), **roles}
+            if policy_after is not None and not (roles["small_instances"] and roles["large_instances"]):
+                # Same rule run_arm applies to a homogeneous layout.
+                merged.update(large_fresh_traffic_share=0.0, migration_enabled=False)
+            new_policy = RoutingPolicy.from_dict(merged)
+            self.config.policy = new_policy
+            self.state.core.config.policy = new_policy
+            self.state.core.scheduler.policy = new_policy
+            self.state.core.scheduler.reset_fresh_traffic()
+            return {**result, "joined": sorted(ids), "joined_at": time.time(),
+                    "policy_roles": roles, "remaining_joining": sorted(self.state.joining)}
+
+    async def _await_joiner_pods_ready(self, ids: frozenset, timeout_s: float = 180.0) -> None:
+        registry = find_registry()
+        rows = await self.state.core._rpc(registry.snapshot.remote(self.config.layout_id))
+        hosts = {row["instance_id"]: row["endpoint_host"] for row in rows if row["instance_id"] in ids}
+        if set(hosts) != set(ids):
+            raise RuntimeError(f"joiners are not registered: {sorted(ids - set(hosts))}")
+        kube = self.state.bridge.kube
+
+        def unready() -> List[str]:
+            out = []
+            for name, host in hosts.items():
+                pod = kube.pod_for_ip(host)
+                conditions = ((pod or {}).get("status", {}) or {}).get("conditions", []) or []
+                if not any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions):
+                    out.append(name)
+            return out
+
+        deadline = time.monotonic() + timeout_s
+        while True:
+            pending = await asyncio.to_thread(unready)
+            if not pending:
+                return
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"joiner coordinator pods not Ready after {timeout_s:.0f} s: {pending}")
+            await asyncio.sleep(2.0)
 
     # ------------------------------------------------------------ server
 
@@ -528,6 +665,7 @@ class OmpGateway:
             "extproc_serving": self.state._extproc is not None,
             "protocol": PROTOCOL_VERSION,
             "layout_id": self.config.layout_id,
+            "joining": sorted(self.state.joining),
             "maintenance": dict(self.state.maintenance),
             "capturing": self.state.capturing,
             "bindings": descriptors,

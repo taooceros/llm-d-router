@@ -108,6 +108,16 @@ class GatewayCore:
             clients[descriptor["instance_id"]] = InstanceClient(descriptor, actor)
         self.clients = clients
 
+    def add_instances(self, descriptors: List[Dict[str, Any]], actors: Dict[str, Any]) -> None:
+        """Additively bind new engines; existing clients are the same objects afterwards."""
+        clients = dict(self.clients)
+        for descriptor in descriptors:
+            name = descriptor["instance_id"]
+            if name in clients or actors.get(name) is None:
+                raise RuntimeError(f"additive bind refuses bound or actor-less instance: {name}")
+            clients[name] = InstanceClient(descriptor, actors[name])
+        self.clients = clients
+
     def routable_instances(self) -> List[str]:
         return sorted(self.clients)
 
@@ -190,7 +200,7 @@ class GatewayCore:
 
     def candidates(self) -> List[Candidate]:
         rows = []
-        inflight = self._inflight_migrations_by_destination()
+        inflight = self.state.inflight_migrations_by_destination()
         projected = self.projected_usage()
         for instance_id, client in self.clients.items():
             capacity = self.state.capacity(instance_id)
@@ -220,15 +230,6 @@ class GatewayCore:
                 )
             )
         return rows
-
-    def _inflight_migrations_by_destination(self) -> Dict[str, int]:
-        counts: Dict[str, int] = {}
-        for txn in self.state.transactions():
-            if txn["state"] not in ("released", "aborted"):
-                counts[txn["destination_instance"]] = (
-                    counts.get(txn["destination_instance"], 0) + 1
-                )
-        return counts
 
     # ----------------------------------------------- stable request owner
 
@@ -327,9 +328,14 @@ class GatewayCore:
             client = self.clients[instance_id]
             self.state.claim(request_id, instance_id, client.generation)
             capacity = self.state.capacity(instance_id)
-            projected_blocks = blocks_for(
-                prompt_tokens + max_tokens, capacity.block_size if capacity else 256
-            )
+            block_size = capacity.block_size if capacity else 256
+            if self.config.policy.decode_length_blind:
+                # The decode budget is unknown to the scheduler: charge the
+                # prompt plus the same growth allowance admission checked.
+                projected_blocks = (blocks_for(prompt_tokens, block_size)
+                                    + self.config.policy.admission_growth_blocks)
+            else:
+                projected_blocks = blocks_for(prompt_tokens + max_tokens, block_size)
             record["projected_blocks"] = projected_blocks
             self._project_add(instance_id, projected_blocks)
             self._backlog_admitted += 1
@@ -461,7 +467,7 @@ class GatewayCore:
                 client.actor.migration_candidates.remote(
                     min_generated_tokens=policy.min_generated_tokens,
                     min_context_tokens=policy.min_context_tokens,
-                    min_remaining_tokens=policy.min_remaining_tokens,
+                    min_remaining_tokens=0 if policy.decode_length_blind else policy.min_remaining_tokens,
                 )
             )
             if int(proposal["generation"]) != client.generation:
@@ -516,7 +522,7 @@ class GatewayCore:
             source_free_fraction=free_fraction,
             migrations_done=self._migrations_done.get(request_id, 0),
             total_inflight_migrations=sum(
-                self._inflight_migrations_by_destination().values()
+                self.state.inflight_migrations_by_destination().values()
             ),
             unsupported=candidate.get("unsupported_continuation") or [],
         )
@@ -535,6 +541,11 @@ class GatewayCore:
             destination_generation=self.clients[destination].generation,
             max_inflight_per_destination=self.config.policy.max_inflight_migrations_per_destination,
             max_context_tokens=int(candidate["prompt_tokens"]) + int(candidate["generated_tokens"]) + int(candidate["remaining_tokens"]),
+            # Length-blind: the destination reserves only what the policy chose
+            # (current context plus growth allowance), never the final length.
+            reserve_tokens=((reserve["blocks"] + reserve["growth_blocks"])
+                            * self.state.capacity(destination).block_size
+                            if self.config.policy.decode_length_blind else 0),
         )
         if txn is None:
             return {"request_id": request_id, "declined": reason, "trace": trace}
@@ -668,7 +679,9 @@ class GatewayCore:
                     **self._source_arguments(txn), "source_instance": txn.source_instance,
                     "destination_epoch": txn.destination_epoch,
                     "destination_generation": txn.destination_generation,
-                    "max_context_tokens": txn.max_context_tokens, "mechanism": txn.mechanism,
+                    "max_context_tokens": txn.max_context_tokens,
+                    "reserve_tokens": txn.reserve_tokens or txn.max_context_tokens,
+                    "mechanism": txn.mechanism,
                 }
                 reservation = await self._receipt_rpc(
                     destination, transaction_id, "reserve_continuation", "reservation", payload=identity,
@@ -761,7 +774,7 @@ class GatewayCore:
         return self.recovery_status()
 
     def recovery_status(self) -> Dict[str, Any]:
-        unresolved = [row["transaction_id"] for row in self.state.transactions() if row["unresolved"]]
+        unresolved = [row["transaction_id"] for row in self.state.unresolved_transactions()]
         return {
             "ready": not (self._recovery_pending or self.state.storage_error or unresolved
                           or self._orphaned_requests or self._paused_requests),
@@ -774,11 +787,10 @@ class GatewayCore:
     async def _ensure_ready(self) -> None:
         self.state.ensure_healthy()
         await self.recover()
-        for row in self.state.transactions():
-            if row["unresolved"]:
-                emit_event("GATEWAY_RECOVERING_TRANSACTION", transaction=row["transaction_id"],
-                           state=row["state"], unresolved=str(row["unresolved"])[:500])
-                await self._execute(row["transaction_id"], recovering=True)
+        for row in self.state.unresolved_transactions():
+            emit_event("GATEWAY_RECOVERING_TRANSACTION", transaction=row["transaction_id"],
+                       state=row["state"], unresolved=str(row["unresolved"])[:500])
+            await self._execute(row["transaction_id"], recovering=True)
         status = self.recovery_status()
         if not status["ready"]:
             raise RuntimeError(f"gateway fails closed: {status}")

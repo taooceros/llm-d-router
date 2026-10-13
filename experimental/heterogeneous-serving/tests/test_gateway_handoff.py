@@ -4,6 +4,7 @@ import asyncio
 import concurrent.futures
 import json
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -366,6 +367,32 @@ class GatewayHandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual((owner.instance_id, owner.epoch, owner.state), ("large", 1, OwnershipState.CANCELLED))
         self.assertEqual(txn.state, TransactionState.RELEASED)
         self.assertNotIn("resume", self.events)
+
+    async def test_admission_polls_do_not_scale_with_retained_handoffs(self):
+        # Every waiting admission re-checks readiness and candidates at 20 Hz.
+        # Copying each retained handoff's token snapshot per poll saturated the
+        # gateway event loop after the first W0 migration; Envoy's ExtProc
+        # streams then sat unaccepted until gRPC core cancelled them (500s).
+        quiesce = self.source.quiesce
+
+        async def long_context(**identity):
+            return {**await quiesce(**identity), "generated_token_ids": list(range(200_000))}
+
+        self.source.quiesce = long_context
+        txn = self.open_transaction()
+
+        def inflight():
+            return {c.instance_id: c.inflight_migrations for c in self.core.candidates()}
+
+        self.assertEqual(inflight(), {"small": 0, "large": 1})
+        self.assertTrue((await self.core._execute(txn.transaction_id))["committed"])
+        self.assertEqual(len(txn.snapshot["generated_token_ids"]), 200_000)
+        self.assertEqual(inflight(), {"small": 0, "large": 0})
+        started = time.perf_counter()
+        for _ in range(100):
+            await self.core._ensure_ready()
+            self.core.candidates()
+        self.assertLess(time.perf_counter() - started, 0.5)
 
 
 class GatewayLedgerTests(unittest.TestCase):

@@ -27,7 +27,9 @@ There is no invented llm-d plugin or independent EPP placement policy here.
 from __future__ import annotations
 
 import asyncio
-from typing import Any, AsyncIterator
+import concurrent.futures
+import threading
+from typing import Any, AsyncIterator, Optional
 
 import grpc
 import httpx
@@ -48,9 +50,11 @@ _HOP_HEADERS = {
 
 
 class GatewayExternalProcessor(ext_grpc.ExternalProcessorServicer):
-    """Runs the existing ASGI app in the gateway's event loop and ownership scope."""
+    """Frames streams on the gRPC loop; runs the existing ASGI app in the gateway's
+    event loop and ownership scope."""
 
-    def __init__(self, app: Any) -> None:
+    def __init__(self, app: Any, app_loop: asyncio.AbstractEventLoop) -> None:
+        self.app_loop = app_loop
         self.client = httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app, raise_app_exceptions=False),
             base_url="http://omp-gateway",
@@ -111,12 +115,11 @@ class GatewayExternalProcessor(ext_grpc.ExternalProcessorServicer):
 
     async def _dispatch(self, request: tuple[str, str, list[tuple[bytes, bytes]]],
                         body: bytes) -> Any:
+        """Runs on the gateway loop."""
         method, path, headers = request
         if len(body) > MAX_REQUEST_BYTES:
             return self._immediate(413, b'{"detail":"request body too large"}',
                                    [(b"content-type", b"application/json")])
-        # A gRPC cancellation propagates through ASGI to GatewayCore.dispatch,
-        # which already cancels the stable owner safely across migrations.
         response = await self.client.request(method, path, headers=headers, content=body)
         if len(response.content) > MAX_RESPONSE_BYTES:
             raise RuntimeError("gateway response exceeds the ExtProc message limit")
@@ -124,6 +127,14 @@ class GatewayExternalProcessor(ext_grpc.ExternalProcessorServicer):
             response.status_code, response.content, list(response.headers.raw),
             completion=method == "POST" and path.split("?", 1)[0] == "/v1/completions",
         )
+
+    async def _on_app_loop(self, request: tuple[str, str, list[tuple[bytes, bytes]]],
+                           body: bytes) -> Any:
+        # A gRPC cancellation cancels the gateway-loop task and propagates
+        # through ASGI to GatewayCore.dispatch, which already cancels the
+        # stable owner safely across migrations.
+        return await asyncio.wrap_future(
+            asyncio.run_coroutine_threadsafe(self._dispatch(request, body), self.app_loop))
 
     async def Process(self, request_iterator: Any, context: Any) -> AsyncIterator[Any]:
         request = None
@@ -137,13 +148,13 @@ class GatewayExternalProcessor(ext_grpc.ExternalProcessorServicer):
                         raise ValueError("request_headers must be the first message")
                     request = self._headers(message.request_headers)
                     if message.request_headers.end_of_stream:
-                        yield await self._dispatch(request, b"")
+                        yield await self._on_app_loop(request, b"")
                         return
                     yield ext.ProcessingResponse(request_headers=ext.HeadersResponse())
                 else:
                     if kind != "request_body" or not message.request_body.end_of_stream:
                         raise ValueError("expected one complete BUFFERED request_body")
-                    yield await self._dispatch(request, message.request_body.body)
+                    yield await self._on_app_loop(request, message.request_body.body)
                     return
             raise ValueError("ExtProc stream ended before the complete request")
         except asyncio.CancelledError:
@@ -162,25 +173,65 @@ class GatewayExternalProcessor(ext_grpc.ExternalProcessorServicer):
 
 
 class ExtProcServer:
-    """Lifecycle companion of the HTTP server; no second gateway core is made."""
+    """Lifecycle companion of the HTTP server; no second gateway core is made.
+
+    gRPC runs on its own thread and event loop. grpc.aio accepts one call per
+    loop round trip, and gRPC core cancels a call that stays unaccepted for
+    30 s (grpc.server_max_unrequested_time_in_server). On a saturated gateway loop,
+    Envoy's streams were cancelled that way before any gateway code saw them
+    (HTTP 500, upstream "-"). Only stream framing runs on this loop; every
+    request still dispatches on the gateway loop that owns GatewayCore.
+    """
 
     def __init__(self, app: Any, *, host: str = "0.0.0.0", port: int = EXTPROC_PORT) -> None:
-        self.processor = GatewayExternalProcessor(app)
-        self.server = grpc.aio.server(options=(
-            ("grpc.so_reuseport", 0),
-            ("grpc.max_receive_message_length", MAX_REQUEST_BYTES + 64 * 1024),
-            ("grpc.max_send_message_length", MAX_RESPONSE_BYTES + 64 * 1024),
-        ))
-        ext_grpc.add_ExternalProcessorServicer_to_server(self.processor, self.server)
-        self.port = self.server.add_insecure_port(f"{host}:{port}")
-        if not self.port:
-            raise RuntimeError(f"cannot bind ExtProc to {host}:{port}")
+        self.app = app
+        self.address = f"{host}:{port}"
+        self.port = 0
+        self.processor: Optional[GatewayExternalProcessor] = None
+        self._thread: Optional[threading.Thread] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._stopping: Optional[asyncio.Event] = None
 
     async def start(self) -> None:
-        await self.server.start()
+        self.processor = GatewayExternalProcessor(self.app, asyncio.get_running_loop())
+        bound: concurrent.futures.Future = concurrent.futures.Future()
+        self._thread = threading.Thread(target=lambda: asyncio.run(self._serve(bound)),
+                                        name="omp-gateway-extproc", daemon=True)
+        self._thread.start()
+        self.port = await asyncio.wrap_future(bound)
+
+    async def _serve(self, bound: concurrent.futures.Future) -> None:
+        self._loop = asyncio.get_running_loop()
+        self._stopping = asyncio.Event()
+        try:
+            server = grpc.aio.server(options=(
+                ("grpc.so_reuseport", 0),
+                ("grpc.max_receive_message_length", MAX_REQUEST_BYTES + 64 * 1024),
+                ("grpc.max_send_message_length", MAX_RESPONSE_BYTES + 64 * 1024),
+            ))
+            ext_grpc.add_ExternalProcessorServicer_to_server(self.processor, server)
+            port = server.add_insecure_port(self.address)
+            if not port:
+                raise RuntimeError(f"cannot bind ExtProc to {self.address}")
+            await server.start()
+        except BaseException as exc:
+            bound.set_exception(exc)
+            return
+        bound.set_result(port)
+        await self._stopping.wait()
+        # Active handlers are cancelled after the grace period; cancellation
+        # reaches the same core as direct HTTP dispatch on the gateway loop.
+        await server.stop(grace=30)
 
     async def stop(self) -> None:
-        # Active handlers are cancelled before closing their ASGI transport;
-        # cancellation is handled by the same core as direct HTTP dispatch.
-        await self.server.stop(grace=30)
-        await self.processor.close()
+        if self._thread is not None:
+            if self._loop is not None and self._stopping is not None:
+                try:
+                    self._loop.call_soon_threadsafe(self._stopping.set)
+                except RuntimeError:
+                    pass  # _serve already returned (failed start) and closed its loop
+            await asyncio.to_thread(self._thread.join)
+            self._thread = None
+        if self.processor is not None:
+            await self.processor.close()
+            self.processor = None
