@@ -45,6 +45,11 @@
       "bytes": 32198
     },
     {
+      "path": "hetero/vproc/endpoints.py",
+      "sha256": "8072e2775babbaa4e2991aa14a80bbbcfd10063db9428cdb5e32af24c5b5c9fa",
+      "bytes": 15181
+    },
+    {
       "path": "tests/test_gateway_discovery.py",
       "sha256": "3cceeae823a07c020b3a37368343c45be04d0eb115b2c9d8db59a193df3d12eb",
       "bytes": 8103
